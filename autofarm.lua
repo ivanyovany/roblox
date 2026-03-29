@@ -1,7 +1,7 @@
 --[[
 BRAINROT FARMER V236 - ATTRIBUTE TARGETING + HARD PICKUP CONFIRM
-Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro0sd
-
+Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro
+st patric copy 1
 CAMBIOS V236:
 1. Nuevo modo auto por atributos si no se selecciona mutacion manual.
 2. Prioridad de target por rareza, luego nivel, luego distancia.
@@ -161,6 +161,8 @@ local Config = {
     BurstConfirmFrames = 3,
     BurstPostTriggerGrace = 0.05,
     BurstCarrySwapAutoResume = true,
+    BurstUseStPatricGrab = true,
+    BurstStPatricMaxDistance = 100,
     BurstFallbackFireInHold = false,
     BurstSpoofHoldDuration = false,
     BurstSpoofHoldValue = 0.0,
@@ -1809,6 +1811,7 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
         MaxActivationDistance = prompt.MaxActivationDistance,
         HoldDuration = prompt.HoldDuration,
     }
+    local useStPatricGrab = Config.BurstUseStPatricGrab and fireproximityprompt ~= nil
     local originalPromptHoldDuration = math.max(promptPropsBefore.HoldDuration or 0, 0)
     local burstHumanoidPropsBefore = hum and {
         PlatformStand = hum.PlatformStand,
@@ -2682,6 +2685,10 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
     local spoofedHoldDuration = promptPropsBefore.HoldDuration
     pcall(function()
         prompt.RequiresLineOfSight = false
+        if useStPatricGrab then
+            prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, Config.BurstStPatricMaxDistance or 100)
+            prompt.HoldDuration = 0
+        end
         if (Config.BurstPromptMaxDistance or 0) > 0 then
             prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, Config.BurstPromptMaxDistance)
         end
@@ -2700,6 +2707,9 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
 
     Logger:Log(string.format("[BURST_INFO] 3D:%.1f|XZ:%.1f|Y:%.1f|PromptY:%.1f|BurstY:%.1f", d3D, dXZ, hrp.Position.Y, pPos.Y, burstY), Color3.new(0, 1, 1))
     Logger:Log(string.format("[BURST_INFO] Hold:%.1fs|MaxD:%.1f|Anc:%s", hDur, maxDist, tostring(hrp.Anchored)), Color3.new(0, 1, 1))
+    if useStPatricGrab then
+        Logger:Log("[BURST_MODE] ST_PATRIC_FIRE", Color3.new(0, 1, 1))
+    end
     if Config.BurstSpoofHoldDuration and (promptPropsBefore.HoldDuration or 0) > hDur then
         Logger:Log(string.format("[BURST_INFO] HoldSpoof:%.2f->%.2f", promptPropsBefore.HoldDuration or 0, hDur), Color3.new(0, 1, 1))
     end
@@ -2746,6 +2756,16 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
     local function performPromptInteraction(liveChar, liveRoot, livePrompt)
         if not livePrompt then return false, "NO_PROMPT" end
 
+        if useStPatricGrab then
+            local ok, err = pcall(function()
+                fireproximityprompt(livePrompt)
+            end)
+            if ok then
+                return true, "FIRE_PROMPT_STP"
+            end
+            return false, err
+        end
+
         local holdDuration = (originalPromptHoldDuration > 0) and originalPromptHoldDuration or (livePrompt.HoldDuration or 0)
 
         if holdDuration > 0 then
@@ -2776,7 +2796,7 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
         return false, "NO_INTERACT_IMPL"
     end
 
-    local totalAttempts = (originalPromptHoldDuration > 0) and Config.BurstHoldAttempts or Config.BurstRapidAttempts
+    local totalAttempts = (originalPromptHoldDuration > 0 and not useStPatricGrab) and Config.BurstHoldAttempts or Config.BurstRapidAttempts
 
     for attempt = 1, totalAttempts do
         if not Config.Activo then return finishBurst(false, "BURST_ABORT_MANUAL") end
@@ -2933,7 +2953,7 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
         if triggeredObserved and not burstSignals.claimSeen and not hasPromptHiddenAfterInteraction()
             and probableObservedAt <= 0
             and prompt and prompt:IsDescendantOf(workspace) and prompt.Enabled
-            and lastInteractionAt > 0 and (tick() - lastInteractionAt) >= 2.0 then
+            and lastInteractionAt > 0 and (tick() - lastInteractionAt) >= (useStPatricGrab and 0.60 or 2.0) then
             lastInteractionAt = tick()
             lastConfirmRefireAt = tick()
             maintainBurstPose(charB, hrpB, false)
