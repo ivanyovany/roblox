@@ -1,5 +1,5 @@
 -- ==========================================================
--- SPY SCANNER OPTIMIZADO: GUI ARRASTRABLE + BUFFER CERO LAG
+-- SPY SCANNER OPTIMIZADO: GUI ARRASTRABLE + BUFFER CERO LAGg
 -- ==========================================================
 
 local CoreGui = game:GetService("CoreGui")
