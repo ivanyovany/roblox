@@ -1,6 +1,6 @@
 --[[
 BRAINROT FARMER V236 - ATTRIBUTE TARGETING + HARD PICKUP CONFIRM
-Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado segurosd
+Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro
 
 CAMBIOS V236:
 1. Nuevo modo auto por atributos si no se selecciona mutacion manual.
@@ -165,7 +165,7 @@ local Config = {
     BurstSpoofHoldDuration = false,
     BurstSpoofHoldValue = 0.0,
     BurstCarryConfirmWindow = 2.50,  -- ampliado: espera que server replique reparent
-    BurstPromptMaxDistance = 100,
+    BurstPromptMaxDistance = 0,
     BurstRapidAttempts = 4,
     BurstHoldAttempts = 2,
     BurstRapidAttemptDelay = 0.08,
@@ -190,6 +190,7 @@ local Config = {
     PostPickupFieldPoll = 0.05,
     BurstHoldExtra = 0.12,
     BurstPromptRootOffset = 2.80,
+    BurstPromptVerticalOffset = -0.90,
     BurstPostTriggerRelease = false,   -- OFF: no liberar personaje después del trigger (evita caída mortal)
     BurstPostFireResolveWindow = 0.80,  -- ampliar ventana de detección de carry attach
     BurstFreeInteractDelay = 0.06,
@@ -604,12 +605,10 @@ local function GetBurstPickupCFrame(targetRoot, prompt)
     local promptPos = GetPromptWorldPosition(prompt, targetRoot and targetRoot.Position or nil)
     local fallenLimit = workspace.FallenPartsDestroyHeight or -500
     local minSafeY = fallenLimit + 25
-    local referenceY = (Config.Home and Config.Home.Position.Y) or promptPos.Y
-    local transitDepthY = math.max(referenceY + (Config.BurstTransitDepth or 0), minSafeY)
-    local offsetY = promptPos.Y + (Config.BurstPromptRootOffset or 0)
+    local desiredY = promptPos.Y + (Config.BurstPromptVerticalOffset or -0.90)
 
-    -- El script que si funciona no se posiciona sobre el prompt; mantiene el HRP a profundidad de transito.
-    local burstY = math.min(offsetY, transitDepthY)
+    -- Mantenernos cerca del prompt real para que validen distancia en servidor.
+    local burstY = math.max(desiredY, minSafeY)
 
     local burstPos = Vector3.new(promptPos.X, burstY, promptPos.Z)
     local burstLook = Vector3.new(targetRoot.Position.X, burstY, targetRoot.Position.Z)
