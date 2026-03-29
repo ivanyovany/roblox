@@ -1,6 +1,6 @@
 --[[
 BRAINROT FARMER V236 - ATTRIBUTE TARGETING + HARD PICKUP CONFIRM
-Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro0
+Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro0s
 
 CAMBIOS V236:
 1. Nuevo modo auto por atributos si no se selecciona mutacion manual.
