@@ -1,6 +1,6 @@
 --[[
 BRAINROT FARMER V236 - ATTRIBUTE TARGETING + HARD PICKUP CONFIRM
-Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro
+Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro0
 
 CAMBIOS V236:
 1. Nuevo modo auto por atributos si no se selecciona mutacion manual.
@@ -173,6 +173,7 @@ local Config = {
     BurstPostFireConfirmWindow = 6.50,  -- ampliado: da tiempo al server para procesar tras trigger  -- ampliado: dar tiempo al servidor para adjuntar RenderedBrainrot
     BurstPromptSetupDelay = 0.15,
     BurstClaimSettleWindow = 6.00,
+    BurstAllowWorldOnlyConfirm = false,
     CarrySwapResumeConfirmWindow = 4.00,
     CarryClearHomeWindow = 3.00,
     CarryClearPoll = 0.05,
@@ -2524,8 +2525,25 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
                     tostring(targetGone),
                     tostring(promptGone)
                 )
-                Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. worldReason, Color3.new(0, 1, 0))
-                return true, worldReason
+
+                local directOk, directReason = getDirectCarryStateConfirmation()
+                if directOk then
+                    Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(directReason), Color3.new(0, 1, 0))
+                    return true, directReason
+                end
+
+                local toolOk, toolReason = getCarryConfirmation()
+                if toolOk then
+                    Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(toolReason), Color3.new(0, 1, 0))
+                    return true, toolReason
+                end
+
+                if Config.BurstAllowWorldOnlyConfirm then
+                    Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. worldReason, Color3.new(0, 1, 0))
+                    return true, worldReason
+                end
+
+                Logger:Log("[TELEMETRY] CLAIM_WORLD_STABLE_NO_ATTACH", Color3.new(1, 0.6, 0))
             end
 
             RS.Heartbeat:Wait()
