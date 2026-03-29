@@ -163,6 +163,7 @@ local Config = {
     BurstCarrySwapAutoResume = true,
     BurstUseStPatricGrab = true,
     BurstStPatricMaxDistance = 100,
+    BurstStPatricHeightOffset = -24,
     BurstFallbackFireInHold = false,
     BurstSpoofHoldDuration = false,
     BurstSpoofHoldValue = 0.0,
@@ -608,10 +609,19 @@ local function GetBurstPickupCFrame(targetRoot, prompt)
     local promptPos = GetPromptWorldPosition(prompt, targetRoot and targetRoot.Position or nil)
     local fallenLimit = workspace.FallenPartsDestroyHeight or -500
     local minSafeY = fallenLimit + 25
-    local desiredY = promptPos.Y + (Config.BurstPromptVerticalOffset or -0.90)
+    local burstY
 
-    -- Mantenernos cerca del prompt real para que validen distancia en servidor.
-    local burstY = math.max(desiredY, minSafeY)
+    if Config.BurstUseStPatricGrab then
+        local baseY = Config.Home and Config.Home.Position.Y
+        local safeTravelY = (baseY or promptPos.Y) + (Config.BurstTransitDepth or -6.50)
+        local promptOffsetY = promptPos.Y + (Config.BurstStPatricHeightOffset or -24)
+        burstY = math.max(safeTravelY, promptOffsetY, minSafeY)
+    else
+        local desiredY = promptPos.Y + (Config.BurstPromptVerticalOffset or -0.90)
+
+        -- Mantenernos cerca del prompt real para que validen distancia en servidor.
+        burstY = math.max(desiredY, minSafeY)
+    end
 
     local burstPos = Vector3.new(promptPos.X, burstY, promptPos.Z)
     local burstLook = Vector3.new(targetRoot.Position.X, burstY, targetRoot.Position.Z)
