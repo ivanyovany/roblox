@@ -124,7 +124,7 @@ local Config = {
     BurstRapidAttempts = 4,
     BurstHoldAttempts = 2,
     BurstRapidAttemptDelay = 0.08,
-    BurstPostFireConfirmWindow = 2.00,  -- ampliado: dar tiempo al servidor para adjuntar RenderedBrainrot
+    BurstPostFireConfirmWindow = 4.50,  -- ampliado: da tiempo al server para procesar tras trigger  -- ampliado: dar tiempo al servidor para adjuntar RenderedBrainrot
     BurstPromptSetupDelay = 0.15,
     BurstClaimSettleWindow = 5.00,
     CarrySwapResumeConfirmWindow = 4.00,
@@ -2796,6 +2796,21 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
             local refireOk, refireMode = performPromptInteraction(charB, hrpB, prompt)
             if refireOk then
                 Logger:Log("[TELEMETRY] GRAB_REFIRE mode=" .. tostring(refireMode), Color3.new(1, 1, 0))
+            end
+        end
+
+        -- Triggered pero sin claim aun: el server puede haber rechazado el primer fire.
+        -- Reintenta una vez despues de 2s para darle otra oportunidad.
+        if triggeredObserved and not burstSignals.claimSeen and not hasPromptHiddenAfterInteraction()
+            and probableObservedAt <= 0
+            and prompt and prompt:IsDescendantOf(workspace) and prompt.Enabled
+            and lastInteractionAt > 0 and (tick() - lastInteractionAt) >= 2.0 then
+            lastInteractionAt = tick()
+            lastConfirmRefireAt = tick()
+            maintainBurstPose(charB, hrpB, false)
+            local retryOk, retryMode = performPromptInteraction(charB, hrpB, prompt)
+            if retryOk then
+                Logger:Log("[TELEMETRY] GRAB_TRIGGER_RETRY mode=" .. tostring(retryMode), Color3.new(1, 0.7, 0))
             end
         end
 
