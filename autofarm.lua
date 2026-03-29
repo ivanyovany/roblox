@@ -1,3360 +1,3553 @@
---[[
-BRAINROT FARMER V236 - ATTRIBUTE TARGETING + HARD PICKUP CONFIRM
-Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
 
-CAMBIOS V236:
-1. Nuevo modo auto por atributos si no se selecciona mutacion manual.
-2. Prioridad de target por rareza, luego nivel, luego distancia.
-3. Se endurece la confirmacion de pickup con HoldWeld, RenderedBrainrot y RightGrip.
-4. Los eventos transitorios del burst ya no confirman pickup con ruido generico.
-5. Se mantiene compatibilidad total con el filtro manual por mutacion.
+local scriptVersion = "stpatric-v2-test"
 
-CAMBIOS V235:
-1. DEAD es terminal y solo se libera con CharacterAdded estable.
-2. Se separa salud minima de arranque y salud minima de recuperacion.
-3. El burst usa hold real cuando el prompt lo requiere.
-4. Despues del trigger real se libera el character para dejar pasar el carry del servidor.
-5. Se confirma pickup por HoldWeld, RenderedBrainrot en character y reparent al jugador.
-6. NUEVO: Carry Swap Auto Resume - si la entidad falla DESPUES del trigger, el juego
-   esta haciendo un swap de personaje (mecanica carry). En ese caso NO se detiene el
-   script en CharacterRemoving, y el farming reanuda automaticamente tras el respawn.
-]]
+print("--- INICIANDO OSAKA " .. scriptVersion .. " (ST PATRIC DEDICADO) ---")
 
 local Players = game:GetService("Players")
+local TS = game:GetService("TweenService")
 local RS = game:GetService("RunService")
-local CoreGui = game:GetService("CoreGui")
-local UIS = game:GetService("UserInputService")
 
-local player = Players.LocalPlayer
-local scriptName = "IvanForensicsV236"
+local LP = Players.LocalPlayer
 
-local function resolveGuiParent()
-    local ok, guiParent = pcall(function()
-        return gethui and gethui()
-    end)
-    if ok and guiParent then
-        return guiParent
-    end
-    return CoreGui
-end
+local watchMode = false
+local autoPilot = false
+local isReturning = false
+local isGrabbing = false
+local returnLocked = false
+local scriptClosed = false
+local towerPriorityMode = false
+local eventShieldMode = false
+local isRespawning = false
 
-local GuiParent = resolveGuiParent()
+local farmSpeed = 700
+local firstTripSpeed = 700
+local startupStabilizeTime = 0.45
+local safeDepth = -6.5
+local depositRise = 0.08
+local returnAt = 6
+local returnApproachDepth = -8.5
+local returnSettleDepth = -4.0
+local returnHoverDepth = -1.6
+local returnGoalTolerance = 1.75
+local returnWallOffset = 9
+local returnPeekTime = 0.10
+local returnDamageThreshold = 10
+local depositPeekAttempts = 3
+local depositRetryCooldown = 0.75
+local depositSettleTime = 0.16
+local depositSafeConfirmAttempt = 2
+local towerMinLevel = 110
+local shieldSinkOffset = -2.35
+local shieldDamageThreshold = 6
+local shieldRetreatStep = 0.35
+local shieldRetreatMax = 3.8
+local shieldEmergencyStep = 0.8
+local shieldAutoHeal = true
+local shieldRecoverStep = 0.08
+local shieldRecoverInterval = 0.30
+local shieldRecoverDelayAfterHit = 0.80
+local shieldExitStabilizeTime = 0.18
+local stPatricSubmitCooldown = 0.60
+local stPatricLastSubmitAttempt = 0
+local stPatricPromptHeightOffset = -24
+local stPatricNearFullMargin = 1
+local stPatricPostTriggerDelay = 0.12
+local stPatricSubmitCheckInterval = 0.06
+local stPatricRequiredDrainChecks = 1
+local stPatricConfirmedDrainWindow = 1.6
+local stPatricUnconfirmedDrainWindow = 1.4
+local stPatricRepromptDelay = 0.35
+local stPatricHoldSnapDistance = 3.5
+local stPatricImmediateRepromptDelay = 0.18
+local stPatricConfirmTimeout = 5.2
+local stPatricAssumeSubmitDelay = 0.45
 
-local function destroyExistingGui()
-    local primaryGui = GuiParent and GuiParent:FindFirstChild(scriptName)
-    if primaryGui then
-        primaryGui:Destroy()
-    end
+local invCount = 0
+local basePos = nil
+local travelBaseY = nil
+local sessionGrabCount = 0
 
-    if GuiParent ~= CoreGui then
-        local fallbackGui = CoreGui:FindFirstChild(scriptName)
-        if fallbackGui then
-            fallbackGui:Destroy()
-        end
-    end
-end
+local blacklist = {}
+local grabAttempts = 0
+local currentTarget = nil
 
-local function copyToClipboard(text)
-    if type(setclipboard) == "function" then
-        local ok = pcall(setclipboard, text)
-        if ok then
-            return true
-        end
-    end
+local targetCache = {}
+local lastScan = 0
+local scanInterval = 0.35
+local waveCleanupInterval = 1.0
+local nextWaveCleanup = 0
+local forceRescan = false
+local lastDepositAttempt = 0
+local lastBrainrotSpawnLog = 0
+local pendingBrainrotSpawnCount = 0
+local pendingBrainrotSpawnSample = nil
+local brainrotSpawnLogWindow = 1.25
+local logEnabled = true
+local maxStoredLogs = 250
+local storedLogs = {}
+local lastScanSummary = ""
+local lastSelectionSummary = ""
+local lastScanHint = ""
+local startupReleaseTime = 0
+local firstTripPending = false
+local activeRunToken = 0
 
-    if type(toclipboard) == "function" then
-        local ok = pcall(toclipboard, text)
-        if ok then
-            return true
-        end
-    end
+local flyValue = Instance.new("CFrameValue")
 
-    return false
-end
+local diedConn = nil
+local charAddedConn = nil
+local brainrotAddedConn = nil
+local steppedConn = nil
+local mainLoopThread = nil
+local mainButton = nil
+local towerButton = nil
+local shieldButton = nil
+local copyLogsButton = nil
+local resetLogsButton = nil
+local shieldCFrame = nil
+local shieldBaseCFrame = nil
+local shieldRetreatOffset = 0
+local shieldLastHealth = nil
+local shieldLastDamageTime = 0
+local shieldLastRecoverTime = 0
+local characterPartStateBackup = {}
+local collisionModeLabel = "NORMAL"
+local baselineToolCounts = {}
+local farmToolTrackingReliable = false
+local stPatricSubmitPromptCache = nil
+local getCharacter
+local getHumanoid
+local getRoot
 
-if _G.IvanFarmer_Cleanup then _G.IvanFarmer_Cleanup() end
-destroyExistingGui()
-
--- ==============================================================================
--- 1. ESTRUCTURAS BÁSICAS Y UTILIDADES
--- ==============================================================================
-local MAX_LOGS = 60
-local Connections = {}
-local Threads = {}
-
-local Logger = nil
-
-local function reportProtectedError(context, err)
-    local message = tostring(err)
-    local trace = debug.traceback(message, 2)
-    local lines = {}
-
-    for line in string.gmatch(trace, "[^\r\n]+") do
-        table.insert(lines, line)
-    end
-
-    if Logger then
-        Logger.LastErrorLines = lines
-        Logger:Log("[SCRIPT_ERROR] " .. tostring(context) .. ": " .. message, Color3.new(1, 0.2, 0.2))
-        for index, line in ipairs(lines) do
-            if index > 1 then
-                Logger:Log("[STACK] " .. tostring(line), Color3.new(1, 0.5, 0.5))
-            end
-        end
-    end
-
-    return message
-end
-
-local function connectProtected(event, callback, context)
-    return event:Connect(function(...)
-        xpcall(callback, function(err)
-            return reportProtectedError(context or "EVENT_CALLBACK", err)
-        end, ...)
-    end)
-end
-
-local function safeConnect(event, callback, context)
-    local conn = connectProtected(event, callback, context)
-    table.insert(Connections, conn)
-    return conn
-end
-
-local function safeSpawn(context, callback)
-    return task.spawn(function()
-        xpcall(callback, function(err)
-            return reportProtectedError(context or "TASK", err)
-        end)
-    end)
-end
-
-local Config = {
-    Activo = false, 
-    Mutacion = nil, 
-    MinTargetLevel = 0,
-    Y_Transito = -3.00, 
-    Y_Cobro = -4.00,
-    BurstTransitDepth = -6.50,
-    Distancia = 3.0, 
-    Velocidad = 400, 
-    Home = nil,
-    HomeSafetyMargin = 2.0,
-    StableVyEpsilon = 1.5,
-    StablePosEpsilon = 0.35,
-    ReleaseStableFrames = 8,
-    HomeStableFrames = 6,
-    RespawnStableFrames = 12,
-    RespawnGuardSeconds = 1.75,
-    EmergencyGuardSeconds = 2.25,
-    MinStartHealth = 50.0,
-    MinRecoverHealth = 1.0,
-    BurstMode = "TRANSIT_PLUS_COBRO",
-    BurstProbeFree = false,
-    BurstFireEvery = 0.10,
-    BurstHoldPadding = 0.25,
-    AutoReleaseRetryEvery = 0.40,
-    BurstConfirmFrames = 3,
-    BurstPostTriggerGrace = 0.05,
-    BurstCarrySwapAutoResume = true,
-    BurstFallbackFireInHold = false,
-    BurstSpoofHoldDuration = true,
-    BurstSpoofHoldValue = 0.0,
-    BurstCarryConfirmWindow = 2.50,  -- ampliado: espera que server replique reparent
-    BurstPromptMaxDistance = 100,
-    BurstRapidAttempts = 4,
-    BurstHoldAttempts = 2,
-    BurstRapidAttemptDelay = 0.08,
-    BurstPostFireConfirmWindow = 4.50,  -- ampliado: da tiempo al server para procesar tras trigger  -- ampliado: dar tiempo al servidor para adjuntar RenderedBrainrot
-    BurstPromptSetupDelay = 0.15,
-    BurstClaimSettleWindow = 5.00,
-    CarrySwapResumeConfirmWindow = 4.00,
-    CarryClearHomeWindow = 3.00,
-    CarryClearPoll = 0.05,
-    ReturnApproachDepth = -8.50,
-    ReturnSettleDepth = -4.00,
-    ReturnHoverDepth = -1.60,
-    ReturnStageDelay = 0.08,
-    ReturnHoverFree = true,
-    ReturnTouchWindow = true,
-    ReturnForceUnequip = true,
-    ReturnUnequipEvery = 0.20,
-    ReturnAt = 2,
-    ReturnWhenNoTargets = true,
-    PostPickupFieldWindow = 2.00,   -- ampliado: tiempo para detectar RenderedBrainrot en personaje
-    PostPickupFieldPoll = 0.05,
-    BurstHoldExtra = 0.12,
-    BurstPromptRootOffset = 2.80,
-    BurstPostTriggerRelease = false,   -- OFF: no liberar personaje después del trigger (evita caída mortal)
-    BurstPostFireResolveWindow = 0.80,  -- ampliar ventana de detección de carry attach
-    BurstFreeInteractDelay = 0.06,
-    BurstReSnapDistance = 2.5,
-    BurstHoverHoldEnabled = false,      -- OFF: mantener personaje anclado en lugar de física libre
-    BurstHoverMaxVelocity = 60,
-    BurstHoverResponsiveness = 28,
-    BurstHoverMaxForce = 1000000,
-    TargetRetryCooldown = 2.75,
-    TargetSuccessCooldown = 1.50,
-    BurstSoftResetReasons = {
-        NO_PROMPT = true,
-        PROMPT_NOT_CONFIRMED = true,
-        TRIGGER_WITHOUT_PICKUP_CONFIRM = true,
-        TARGET_VANISHED_PRE_CONFIRM = true,
-        CLAIM_WITHOUT_CARRY_CONFIRM = true,
-        CLAIM_SETTLE_LOST = true
-    }
+local filtros = {
+	["Common"] = true,
+	["Uncommon"] = true,
+	["Rare"] = true,
+	["Epic"] = true,
+	["Legendary"] = true,
+	["Mythic"] = true,
+	["Cosmic"] = true,
+	["Secret"] = true,
+	["Divine"] = true,
+	["Celestial"] = true,
+	["Infinite"] = true,
 }
 
-local RarityAliases = {
-    ["Common"] = "Common",
-    ["Uncommon"] = "Uncommon",
-    ["Rare"] = "Rare",
-    ["Epic"] = "Epic",
-    ["Legendary"] = "Legendary",
-    ["Mythic"] = "Mythic",
-    ["Mythical"] = "Mythic",
-    ["Mythicals"] = "Mythic",
-    ["Cosmic"] = "Cosmic",
-    ["Secret"] = "Secret",
-    ["Divine"] = "Divine",
-    ["Celestial"] = "Celestial",
-    ["Celestials"] = "Celestial",
-    ["Infinite"] = "Infinite",
-    ["Infinity"] = "Infinite",
-    ["Infiniti"] = "Infinite",
-    ["Infinitis"] = "Infinite",
-    ["Infinites"] = "Infinite",
+local rarityPriority = {
+	["Infinite"] = 100,
+	["Celestial"] = 95,
+	["Divine"] = 90,
+	["Secret"] = 70,
+	["Cosmic"] = 60,
+	["Mythic"] = 50,
+	["Legendary"] = 40,
+	["Epic"] = 30,
+	["Rare"] = 20,
+	["Uncommon"] = 10,
+	["Common"] = 1,
 }
 
-local RarityPriority = {
-    ["Infinite"] = 100,
-    ["Celestial"] = 95,
-    ["Divine"] = 90,
-    ["Secret"] = 70,
-    ["Cosmic"] = 60,
-    ["Mythic"] = 50,
-    ["Legendary"] = 40,
-    ["Epic"] = 30,
-    ["Rare"] = 20,
-    ["Uncommon"] = 10,
-    ["Common"] = 1,
+local rarityAliases = {
+	["Common"] = "Common",
+	["Uncommon"] = "Uncommon",
+	["Rare"] = "Rare",
+	["Epic"] = "Epic",
+	["Legendary"] = "Legendary",
+	["Mythic"] = "Mythic",
+	["Mythical"] = "Mythic",
+	["Mythicals"] = "Mythic",
+	["Cosmic"] = "Cosmic",
+	["Secret"] = "Secret",
+	["Divine"] = "Divine",
+	["Celestial"] = "Celestial",
+	["Celestials"] = "Celestial",
+	["Infinite"] = "Infinite",
+	["Infinity"] = "Infinite",
+	["Infiniti"] = "Infinite",
+	["Infinitis"] = "Infinite",
+	["Infinites"] = "Infinite",
 }
 
-local AllowedTargetRarities = {
-    ["Common"] = true,
-    ["Uncommon"] = true,
-    ["Rare"] = true,
-    ["Epic"] = true,
-    ["Legendary"] = true,
-    ["Mythic"] = true,
-    ["Cosmic"] = true,
-    ["Secret"] = true,
-    ["Divine"] = true,
-    ["Celestial"] = true,
-    ["Infinite"] = true,
+local filterOrder = {
+	"Infinite",
+	"Celestial",
+	"Divine",
+	"Secret",
+	"Cosmic",
+	"Mythic",
+	"Legendary",
+	"Epic",
+	"Rare",
+	"Uncommon",
+	"Common",
 }
 
 local function resolveRarityName(name)
-    return RarityAliases[name] or name
+	return rarityAliases[name] or name
 end
 
-local function getActiveTargetMode()
-    if Config.Mutacion and Config.Mutacion ~= "" then
-        return "MUTATION"
-    end
-    return "ATTRIBUTES"
+local stPatricKeywords = {
+	"st",
+	"patric",
+	"patrick",
+	"saint",
+	"clover",
+	"rainbow",
+	"gold",
+	"pot",
+	"cauld",
+	"olla",
+	"submit",
+	"deliver",
+	"build",
+	"brainrot",
+	"yes",
+}
+
+local function containsKeyword(text)
+	if type(text) ~= "string" or text == "" then
+		return false, nil
+	end
+
+	local lowered = string.lower(text)
+	for _, keyword in ipairs(stPatricKeywords) do
+		if lowered:find(keyword, 1, true) then
+			return true, keyword
+		end
+	end
+
+	return false, nil
 end
 
-local function getTargetModeSummary()
-    if getActiveTargetMode() == "MUTATION" then
-        return "mutacion=" .. tostring(Config.Mutacion)
-    end
-    return string.format("atributos rareza>nivel>dist minLvl=%d", Config.MinTargetLevel or 0)
+local function safeName(instance)
+	if not instance then
+		return ""
+	end
+
+	local name = ""
+	pcall(function()
+		name = instance.Name
+	end)
+	return name or ""
 end
 
-local function tryGetAttribute(instance, attributeName)
-    if not instance or not attributeName then
-        return nil
-    end
+local function safeText(instance)
+	if not instance then
+		return ""
+	end
 
-    local ok, value = pcall(function()
-        return instance:GetAttribute(attributeName)
-    end)
-    if ok then
-        return value
-    end
-    return nil
+	local text = ""
+	pcall(function()
+		text = instance.Text
+	end)
+	return text or ""
 end
 
-local function getAttributeFromChain(instance, attributeNames)
-    local cursor = instance
+local function safeParent(instance)
+	if not instance then
+		return nil
+	end
 
-    while cursor and cursor ~= game do
-        for _, attributeName in ipairs(attributeNames) do
-            local value = tryGetAttribute(cursor, attributeName)
-            if value ~= nil then
-                return value, attributeName, cursor
-            end
-        end
-        cursor = cursor.Parent
-    end
-
-    return nil, nil, nil
+	local parent = nil
+	pcall(function()
+		parent = instance.Parent
+	end)
+	return parent
 end
 
-local function parseLevelValue(value)
-    if type(value) == "number" then
-        return value
-    end
-    if type(value) == "string" then
-        return tonumber(string.match(value, "%d+"))
-    end
-    return nil
+local function safeIsA(instance, className)
+	if not instance then
+		return false
+	end
+
+	local result = false
+	pcall(function()
+		result = instance:IsA(className)
+	end)
+	return result
 end
 
-local function getTargetLevel(target)
-    if not target then
-        return 0
-    end
+local function safeIsDescendantOf(instance, ancestor)
+	if not instance or not ancestor then
+		return false
+	end
 
-    local levelValue = getAttributeFromChain(target, {"Level", "Lvl", "level", "lvl"})
-    local parsedLevel = parseLevelValue(levelValue)
-    if parsedLevel then
-        return parsedLevel
-    end
-
-    for _, descendant in ipairs(target:GetDescendants()) do
-        local loweredName = string.lower(descendant.Name)
-        if loweredName == "level" or loweredName == "lvl" then
-            if descendant:IsA("IntValue") or descendant:IsA("NumberValue") then
-                return descendant.Value
-            elseif descendant:IsA("StringValue") then
-                local parsedValue = parseLevelValue(descendant.Value)
-                if parsedValue then
-                    return parsedValue
-                end
-            end
-        end
-
-        if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
-            local parsedText = parseLevelValue(descendant.Text)
-            if parsedText then
-                return parsedText
-            end
-        end
-    end
-
-    return 0
+	local result = false
+	pcall(function()
+		result = instance:IsDescendantOf(ancestor)
+	end)
+	return result
 end
 
-local function getTargetMutation(target)
-    local mutationValue = getAttributeFromChain(target, {"Mutation", "mutation"})
-    if type(mutationValue) == "string" and mutationValue ~= "" and mutationValue ~= "None" then
-        return mutationValue
-    end
-    return nil
+local function safeInstancePath(instance)
+	if not instance then
+		return "nil"
+	end
+
+	local ok, fullName = pcall(function()
+		return instance:GetFullName()
+	end)
+	if ok and fullName and fullName ~= "" then
+		return fullName
+	end
+
+	return safeName(instance)
+end
+
+local function safeGuiVisible(instance)
+	if not instance then
+		return false
+	end
+
+	local current = instance
+	while current do
+		if safeIsA(current, "ScreenGui") then
+			local enabled = true
+			pcall(function()
+				enabled = current.Enabled
+			end)
+			if not enabled then
+				return false
+			end
+		elseif safeIsA(current, "GuiObject") then
+			local visible = true
+			pcall(function()
+				visible = current.Visible
+			end)
+			if not visible then
+				return false
+			end
+		end
+		current = safeParent(current)
+	end
+
+	return true
+end
+
+local function safeGuiArea(instance)
+	if not instance or not safeIsA(instance, "GuiObject") then
+		return 0
+	end
+
+	local area = 0
+	pcall(function()
+		area = instance.AbsoluteSize.X * instance.AbsoluteSize.Y
+	end)
+	return area
+end
+
+local function getGuiTextMatchScore(text)
+	if type(text) ~= "string" or text == "" then
+		return 0
+	end
+
+	local lowered = string.lower(text)
+	if lowered == "yes" or lowered == "yes!" then
+		return 14
+	end
+	if lowered == "confirm" or lowered == "confirm!" then
+		return 8
+	end
+	if lowered == "ok" or lowered == "okay" then
+		return 4
+	end
+	if lowered:find("yes", 1, true) then
+		return 10
+	end
+	if lowered:find("confirm", 1, true) then
+		return 6
+	end
+	return 0
+end
+
+local function getStPatricDialogContextScore(root)
+	if not root then
+		return 0
+	end
+
+	local score = 0
+	for _, descendant in ipairs(root:GetDescendants()) do
+		if safeIsA(descendant, "TextLabel") or safeIsA(descendant, "TextButton") then
+			local content = string.lower(safeText(descendant))
+			if content:find("submit brainrots", 1, true) then
+				score = score + 8
+			elseif content:find("build the rainbow", 1, true) then
+				score = score + 7
+			elseif content:find("brainrot", 1, true) then
+				score = score + 4
+			elseif content:find("gone forever", 1, true) then
+				score = score + 4
+			elseif content:find("rainbow", 1, true) or content:find("gold", 1, true) then
+				score = score + 3
+			end
+		end
+	end
+
+	return score
+end
+
+local scoreYesButton
+
+local function getStPatricYesDebugCandidates(limit)
+	local playerGui = LP:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		return "sin PlayerGui"
+	end
+
+	local candidates = {}
+	for _, descendant in ipairs(playerGui:GetDescendants()) do
+		if safeIsA(descendant, "GuiButton") and scoreYesButton then
+			local text = safeText(descendant)
+			local name = safeName(descendant)
+			local path = safeInstancePath(descendant)
+			local visible = safeGuiVisible(descendant)
+			local strictScore = scoreYesButton(descendant)
+			local looseScore = getGuiTextMatchScore(text)
+				+ math.max(0, getGuiTextMatchScore(name) - 2)
+				+ math.max(0, getGuiTextMatchScore(path) - 4)
+
+			if strictScore > 0 or looseScore > 0 then
+				table.insert(candidates, {
+					button = descendant,
+					strictScore = strictScore,
+					looseScore = looseScore,
+					visible = visible,
+					area = safeGuiArea(descendant),
+					text = text,
+					name = name,
+					path = path,
+				})
+			end
+		end
+	end
+
+	table.sort(candidates, function(a, b)
+		if a.strictScore ~= b.strictScore then
+			return a.strictScore > b.strictScore
+		end
+		if a.looseScore ~= b.looseScore then
+			return a.looseScore > b.looseScore
+		end
+		if a.visible ~= b.visible then
+			return a.visible
+		end
+		if a.area ~= b.area then
+			return a.area > b.area
+		end
+		return a.path < b.path
+	end)
+
+	if #candidates == 0 then
+		return "sin candidatos GuiButton"
+	end
+
+	local parts = {}
+	for i = 1, math.min(limit or 3, #candidates) do
+		local entry = candidates[i]
+		table.insert(
+			parts,
+			string.format(
+				"#%d strict=%d loose=%d visible=%s area=%d text=%s name=%s path=%s",
+				i,
+				entry.strictScore,
+				entry.looseScore,
+				tostring(entry.visible),
+				entry.area,
+				tostring(entry.text),
+				tostring(entry.name),
+				tostring(entry.path)
+			)
+		)
+	end
+
+	return table.concat(parts, " || ")
+end
+
+local function getVisibleStPatricDialog()
+	local playerGui = LP:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		return false, nil, 0
+	end
+
+	local bestPath = nil
+	local bestScore = 0
+	for _, descendant in ipairs(playerGui:GetDescendants()) do
+		if safeIsA(descendant, "GuiObject") and safeGuiVisible(descendant) then
+			local score = getStPatricDialogContextScore(descendant)
+			if score > bestScore then
+				bestScore = score
+				bestPath = safeInstancePath(descendant)
+			end
+		end
+	end
+
+	return bestScore >= 8, bestPath, bestScore
+end
+
+local function safePromptData(prompt)
+	local data = {
+		actionText = "",
+		objectText = "",
+		enabled = false,
+		holdDuration = 0,
+		maxActivationDistance = 0,
+	}
+
+	if not prompt then
+		return data
+	end
+
+	pcall(function()
+		data.actionText = prompt.ActionText or ""
+	end)
+	pcall(function()
+		data.objectText = prompt.ObjectText or ""
+	end)
+	pcall(function()
+		data.enabled = prompt.Enabled
+	end)
+	pcall(function()
+		data.holdDuration = prompt.HoldDuration or 0
+	end)
+	pcall(function()
+		data.maxActivationDistance = prompt.MaxActivationDistance or 0
+	end)
+
+	return data
+end
+
+local function updateCopyLogsButtonState()
+	if scriptClosed or not copyLogsButton then
+		return
+	end
+
+	copyLogsButton.Text = "COPIAR LOGS (" .. tostring(#storedLogs) .. ")"
+end
+
+local function appendStoredLog(message)
+	table.insert(storedLogs, message)
+	if #storedLogs > maxStoredLogs then
+		table.remove(storedLogs, 1)
+	end
+	updateCopyLogsButtonState()
+end
+
+local function debugLog(eventName, details)
+	if not logEnabled then
+		return
+	end
+
+	local message = string.format("[OSAKA][%.3f][%s]", os.clock(), tostring(eventName))
+	if details and details ~= "" then
+		message = message .. " " .. tostring(details)
+	end
+
+	appendStoredLog(message)
+	print(message)
+end
+
+debugLog("BOOT", "version=" .. scriptVersion)
+
+local function getStoredLogDump()
+	if #storedLogs == 0 then
+		return "[OSAKA] no hay logs capturados todavia"
+	end
+
+	return table.concat(storedLogs, "\n")
+end
+
+local function copyLogsToClipboard(status)
+	local payload = getStoredLogDump()
+	local copyFns = {setclipboard, toclipboard}
+	local copied = false
+	local copyError = nil
+
+	for _, copyFn in ipairs(copyFns) do
+		if type(copyFn) == "function" then
+			local ok, err = pcall(copyFn, payload)
+			if ok then
+				copied = true
+				break
+			end
+			copyError = err
+		end
+	end
+
+	if not copied and type(Clipboard) == "table" and type(Clipboard.set) == "function" then
+		local ok, err = pcall(function()
+			Clipboard.set(payload)
+		end)
+		copied = ok
+		copyError = ok and copyError or err
+	end
+
+	if status then
+		status.Text = copied and ("LOGS COPIADOS: " .. tostring(#storedLogs)) or "NO SE PUDO COPIAR LOGS"
+	end
+
+	debugLog(copied and "LOG_COPY_OK" or "LOG_COPY_FAIL", copied and ("entries=" .. tostring(#storedLogs)) or tostring(copyError or "sin API de clipboard"))
+	return copied
+end
+
+local function clearStoredLogs(status)
+	storedLogs = {}
+	lastScanSummary = ""
+	lastSelectionSummary = ""
+	updateCopyLogsButtonState()
+	if status then
+		status.Text = "LOGS REINICIADOS"
+	end
+end
+
+local function copyLogsAndReset(status)
+	if copyLogsToClipboard(status) then
+		clearStoredLogs(status)
+		if status then
+			status.Text = "LOGS COPIADOS Y REINICIADOS"
+		end
+		debugLog("LOG_RESET_OK", "buffer reiniciado tras copia")
+		return true
+	end
+	return false
+end
+
+local function debugOnce(eventName, details, key)
+	if key ~= nil then
+		if key == lastSelectionSummary and eventName == "TARGET_LOCK" then
+			return
+		end
+		if key == lastScanSummary and eventName == "SCAN" then
+			return
+		end
+	end
+
+	if eventName == "TARGET_LOCK" then
+		lastSelectionSummary = key or ""
+	elseif eventName == "SCAN" then
+		lastScanSummary = key or ""
+	end
+
+	debugLog(eventName, details)
+end
+
+local function invalidateRunToken(reason)
+	activeRunToken = activeRunToken + 1
+	debugLog("RUN_TOKEN", "invalidate=" .. tostring(activeRunToken) .. " reason=" .. tostring(reason or "n/a"))
+	return activeRunToken
+end
+
+local function armStartupStabilization(reason)
+	startupReleaseTime = os.clock() + startupStabilizeTime
+	firstTripPending = true
+	debugLog("STABILIZE", (reason or "inicio") .. " hasta=" .. string.format("%.3f", startupReleaseTime))
+end
+
+local function isOperationValid(runToken)
+	if scriptClosed then
+		return false
+	end
+	if runToken ~= nil and runToken ~= activeRunToken then
+		return false
+	end
+	local humanoid = getHumanoid()
+	local root = getRoot()
+	if not humanoid or not root then
+		return false
+	end
+	return humanoid.Health > 0
+end
+
+function getCharacter()
+	return LP.Character or LP.CharacterAdded:Wait()
+end
+
+function getHumanoid()
+	local character = LP.Character
+	if not character then
+		return nil
+	end
+	return character:FindFirstChildOfClass("Humanoid")
+end
+
+function getRoot()
+	local character = LP.Character
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getOwnedToolCounts()
+	local counts = {}
+	local backpack = LP:FindFirstChildOfClass("Backpack")
+	local character = LP.Character
+
+	local function collect(container)
+		if not container then
+			return
+		end
+
+		for _, child in ipairs(container:GetChildren()) do
+			if child:IsA("Tool") then
+				counts[child.Name] = (counts[child.Name] or 0) + 1
+			end
+		end
+	end
+
+	collect(backpack)
+	collect(character)
+
+	return counts
+end
+
+local function captureBaselineTools()
+	baselineToolCounts = getOwnedToolCounts()
+	farmToolTrackingReliable = false
+	debugLog("BASELINE", "herramientas base capturadas")
+end
+
+local function getFarmToolCount()
+	local total = 0
+	local currentCounts = getOwnedToolCounts()
+
+	for name, count in pairs(currentCounts) do
+		local baselineCount = baselineToolCounts[name] or 0
+		if count > baselineCount then
+			total = total + (count - baselineCount)
+		end
+	end
+
+	if total > 0 then
+		farmToolTrackingReliable = true
+	end
+
+	return total
+end
+
+local function getEquippedToolCount()
+	local total = 0
+	local character = LP.Character
+	if not character then
+		return 0
+	end
+
+	for _, child in ipairs(character:GetChildren()) do
+		if child:IsA("Tool") then
+			total = total + 1
+		end
+	end
+
+	return total
+end
+
+local function syncInventoryCountFromTools()
+	local detectedCount = getFarmToolCount()
+	if detectedCount > returnAt then
+		farmToolTrackingReliable = false
+		debugLog("TOOL_SYNC_SKIP", "detected=" .. tostring(detectedCount) .. " limite=" .. tostring(returnAt))
+		if invCount <= 0 then
+			returnLocked = false
+		end
+		return 0
+	end
+	if detectedCount > 0 then
+		invCount = math.max(invCount, detectedCount)
+	end
+	if invCount <= 0 then
+		returnLocked = false
+	end
+	return detectedCount
+end
+
+local function getEffectiveCarryCount()
+	return math.max(invCount, syncInventoryCountFromTools())
+end
+
+local function forceUnequipFarmTools(humanoid)
+	if not humanoid then
+		return false
+	end
+
+	local beforeCount = getEquippedToolCount()
+	if beforeCount <= 0 then
+		return true
+	end
+
+	debugLog("UNEQUIP", "intentando soltar tools extra=" .. tostring(beforeCount))
+
+	pcall(function()
+		humanoid:UnequipTools()
+	end)
+
+	local deadline = os.clock() + 0.45
+	while os.clock() < deadline do
+		if getEquippedToolCount() < beforeCount then
+			debugLog("UNEQUIP", "ok")
+			return true
+		end
+		task.wait(0.05)
+	end
+
+	local result = getEquippedToolCount() < beforeCount
+	debugLog("UNEQUIP", result and "ok tardio" or "sin cambios")
+	return result
+end
+
+local function getCompactStateLabel()
+	if scriptClosed then
+		return "CLOSED"
+	end
+	if eventShieldMode then
+		return "SHIELD"
+	end
+	if isReturning or returnLocked then
+		return "RETURN"
+	end
+	if isGrabbing then
+		return "GRAB"
+	end
+	if autoPilot and currentTarget then
+		return "GO"
+	end
+	if watchMode then
+		return "STP"
+	end
+	return "OFF"
+end
+
+local function logHealthState(tag, humanoid, previousHealth)
+	if not humanoid then
+		debugLog("HEALTH_TRACE", tostring(tag) .. " hp=nil")
+		return previousHealth
+	end
+
+	local currentHealth = humanoid.Health
+	local deltaText = ""
+	if type(previousHealth) == "number" then
+		deltaText = string.format(" delta=%.2f", currentHealth - previousHealth)
+	end
+	debugLog("HEALTH_TRACE", string.format("%s hp=%.2f%s", tostring(tag), currentHealth, deltaText))
+	return currentHealth
+end
+
+local function updateTowerButtonState()
+	if scriptClosed or not towerButton then
+		return
+	end
+	towerButton.Text = towerPriorityMode and ("LVL " .. tostring(towerMinLevel) .. "+") or "LVL ANY"
+	towerButton.BackgroundColor3 = towerPriorityMode and Color3.fromRGB(210, 145, 55) or Color3.fromRGB(35, 40, 45)
+	towerButton.TextColor3 = Color3.new(1, 1, 1)
+end
+
+local function updateShieldButtonState()
+	if scriptClosed or not shieldButton then
+		return
+	end
+	shieldButton.Text = eventShieldMode and "SHIELD ON" or "SHIELD OFF"
+	shieldButton.BackgroundColor3 = eventShieldMode and Color3.fromRGB(70, 130, 200) or Color3.fromRGB(35, 40, 45)
+	shieldButton.TextColor3 = Color3.new(1, 1, 1)
+end
+
+local function updateButtonState(btn)
+	if scriptClosed then
+		return
+	end
+	btn.Text = "STP | " .. getCompactStateLabel() .. " | " .. collisionModeLabel
+	btn.BackgroundColor3 = watchMode and Color3.fromRGB(0, 200, 100) or Color3.fromRGB(180, 50, 50)
+end
+
+local function resetRunState()
+	invCount = 0
+	grabAttempts = 0
+	currentTarget = nil
+	blacklist = {}
+	targetCache = {}
+	lastScan = 0
+	forceRescan = true
+	isReturning = false
+	isGrabbing = false
+	returnLocked = false
+end
+
+local function resetSessionProgress()
+	sessionGrabCount = 0
+	debugLog("SESSION_RESET", "contador reiniciado")
+end
+
+local function enforceCharacterNoCollision(character)
+	if not character then
+		return
+	end
+	collisionModeLabel = "NO-COLLIDE"
+
+	for _, v in ipairs(character:GetDescendants()) do
+		if v:IsA("BasePart") then
+			if not characterPartStateBackup[v] then
+				characterPartStateBackup[v] = {
+					canCollide = v.CanCollide,
+					canTouch = v.CanTouch,
+				}
+			end
+			v.CanCollide = false
+			v.CanTouch = false
+		end
+	end
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+end
+
+local function restoreCharacterCollisionState()
+	collisionModeLabel = "NORMAL"
+	for part, state in pairs(characterPartStateBackup) do
+		if part and part.Parent then
+			part.CanCollide = state.canCollide
+			part.CanTouch = state.canTouch
+		end
+		characterPartStateBackup[part] = nil
+	end
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+end
+
+local function updateShieldCFrame()
+	if shieldBaseCFrame then
+		local basePos = shieldBaseCFrame.Position
+		local rotation = shieldBaseCFrame - basePos
+		shieldCFrame = CFrame.new(basePos + Vector3.new(0, shieldRetreatOffset, 0)) * rotation
+	else
+		shieldCFrame = nil
+	end
+end
+
+local function configureShieldHumanoid(humanoid, enabled)
+	if not humanoid then
+		return
+	end
+
+	pcall(function()
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, not enabled)
+	end)
+	pcall(function()
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, not enabled)
+	end)
+	pcall(function()
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, not enabled)
+	end)
+	pcall(function()
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Swimming, not enabled)
+	end)
+	pcall(function()
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, not enabled)
+	end)
+
+	humanoid.PlatformStand = enabled
+end
+
+local function restoreFromShield()
+	local character = LP.Character
+	local root = getRoot()
+	local humanoid = getHumanoid()
+	if not root then
+		return
+	end
+
+	root.Anchored = true
+	if shieldBaseCFrame and character then
+		pcall(function()
+			character:PivotTo(shieldBaseCFrame)
+		end)
+	else
+		root.CFrame = CFrame.new(root.Position + Vector3.new(0, math.abs(shieldSinkOffset), 0))
+	end
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+
+	if humanoid then
+		humanoid.PlatformStand = true
+	end
+
+	task.delay(shieldExitStabilizeTime, function()
+		if scriptClosed then
+			return
+		end
+		local delayedRoot = getRoot()
+		local delayedHumanoid = getHumanoid()
+		if delayedRoot then
+			delayedRoot.AssemblyLinearVelocity = Vector3.zero
+			delayedRoot.AssemblyAngularVelocity = Vector3.zero
+			delayedRoot.Anchored = false
+		end
+		if delayedHumanoid then
+			delayedHumanoid.PlatformStand = false
+			pcall(function()
+				delayedHumanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+			end)
+			pcall(function()
+				delayedHumanoid:ChangeState(Enum.HumanoidStateType.Running)
+			end)
+		end
+	end)
+end
+
+local function setEventShieldMode(enabled, status)
+	local root = getRoot()
+	local humanoid = getHumanoid()
+
+	eventShieldMode = enabled
+	if enabled then
+		watchMode = false
+		autoPilot = false
+		isReturning = false
+		isGrabbing = false
+		returnLocked = false
+		currentTarget = nil
+		if root then
+			shieldBaseCFrame = root.CFrame
+			shieldRetreatOffset = shieldSinkOffset
+			shieldLastDamageTime = os.clock()
+			shieldLastRecoverTime = 0
+			updateShieldCFrame()
+			if shieldCFrame and root.Parent then
+				pcall(function()
+					root.Parent:PivotTo(shieldCFrame)
+				end)
+			end
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			root.Anchored = true
+		end
+		if humanoid then
+			shieldLastHealth = humanoid.Health
+			configureShieldHumanoid(humanoid, true)
+		end
+		if status then
+			status.Text = "SHIELD ACTIVO"
+		end
+	else
+		local previousShieldBase = shieldBaseCFrame
+		shieldBaseCFrame = nil
+		shieldCFrame = nil
+		shieldRetreatOffset = 0
+		shieldLastHealth = nil
+		shieldLastDamageTime = 0
+		shieldLastRecoverTime = 0
+		shieldBaseCFrame = previousShieldBase
+		restoreFromShield()
+		shieldBaseCFrame = nil
+		restoreCharacterCollisionState()
+		if humanoid then
+			configureShieldHumanoid(humanoid, false)
+		end
+		if status then
+			status.Text = "SHIELD OFF"
+		end
+	end
+
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+	updateShieldButtonState()
+end
+
+local function removeFromCache(target)
+	for i = #targetCache, 1, -1 do
+		if targetCache[i] == target then
+			table.remove(targetCache, i)
+		end
+	end
 end
 
 local function getTargetRarity(target)
-    if not target then
-        return "Common"
-    end
-
-    local rarityValue = getAttributeFromChain(target, {"Rarity", "RarityName", "Tier", "tier", "Category", "category"})
-    if type(rarityValue) == "string" then
-        local resolved = resolveRarityName(rarityValue)
-        if RarityPriority[resolved] then
-            return resolved
-        end
-    end
-
-    local node = target
-    while node and node ~= workspace do
-        local resolved = resolveRarityName(node.Name)
-        if RarityPriority[resolved] then
-            return resolved
-        end
-        node = node.Parent
-    end
-
-    return "Common"
-end
-
-local function evaluateTargetCandidate(targetModel, targetRoot, prompt, hrp)
-    if not targetModel or not targetRoot or not prompt or not hrp then
-        return nil
-    end
-
-    local dx = hrp.Position.X - targetRoot.Position.X
-    local dz = hrp.Position.Z - targetRoot.Position.Z
-    local distanceXZ = math.sqrt(dx * dx + dz * dz)
-    local rarityName = getTargetRarity(targetModel)
-    local targetLevel = getTargetLevel(targetModel)
-    local targetMutation = getTargetMutation(targetModel)
-
-    if getActiveTargetMode() == "MUTATION" then
-        if targetMutation ~= Config.Mutacion then
-            return nil
-        end
-
-        return {
-            score = -distanceXZ,
-            distance = distanceXZ,
-            rarity = rarityName,
-            level = targetLevel,
-            mutation = targetMutation,
-            mode = "MUTATION",
-        }
-    end
-
-    if not AllowedTargetRarities[rarityName] then
-        return nil
-    end
-
-    if targetLevel < (Config.MinTargetLevel or 0) then
-        return nil
-    end
-
-    return {
-        score = ((RarityPriority[rarityName] or 0) * 100000) + (targetLevel * 100) - distanceXZ,
-        distance = distanceXZ,
-        rarity = rarityName,
-        level = targetLevel,
-        mutation = targetMutation,
-        mode = "ATTRIBUTES",
-    }
-end
-
--- ==============================================================================
--- 2. CAPA UI & LOGGER (Ring Buffer)
--- ==============================================================================
-local UI = { LogLabels = {}, ButtonPool = {}, Minimized = false }
-Logger = {
-    Buffer = table.create(400, ""), LogIndex = 1,
-    Snapshots = table.create(30), SnapIndex = 1,
-    LastErrorLines = nil
-}
-
-local sg = Instance.new("ScreenGui"); sg.Name = scriptName; sg.ResetOnSpawn = false; sg.Parent = GuiParent
-local main = Instance.new("Frame", sg); main.Name = "Main"; main.Size = UDim2.new(0, 260, 0, 315); main.Position = UDim2.new(0.5, -130, 0.28, 0); main.BackgroundColor3 = Color3.fromRGB(15, 15, 15); main.BorderSizePixel = 1; main.ClipsDescendants = true
-main.Active = true
-
-local topBar = Instance.new("Frame", main); topBar.Name = "TopBar"; topBar.Size = UDim2.new(1, 0, 0, 30); topBar.BackgroundColor3 = Color3.fromRGB(0, 160, 80)
-topBar.Active = true
-
-local title = Instance.new("TextLabel", topBar); title.Size = UDim2.new(1, -34, 1, 0); title.Position = UDim2.new(0, 6, 0, 0); title.BackgroundTransparency = 1; title.Text = "V235 - CARRY SWAP AUTO RESUME"; title.TextColor3 = Color3.new(1,1,1); title.Font = Enum.Font.SourceSansBold; title.TextSize = 14; title.TextXAlignment = Enum.TextXAlignment.Left
-local btnToggle = Instance.new("TextButton", topBar); btnToggle.Size = UDim2.new(0, 28, 0, 22); btnToggle.Position = UDim2.new(1, -31, 0, 4); btnToggle.Text = "−"; btnToggle.BackgroundColor3 = Color3.fromRGB(40, 40, 40); btnToggle.TextColor3 = Color3.new(1,1,1)
-
-local logBox = Instance.new("ScrollingFrame", main); logBox.Name = "LogBox"; logBox.Size = UDim2.new(0.9, 0, 0, 130); logBox.Position = UDim2.new(0.05, 0, 0, 128); logBox.BackgroundColor3 = Color3.fromRGB(5, 5, 5); logBox.ScrollBarThickness = 4
-local logLayout = Instance.new("UIListLayout", logBox); logLayout.SortOrder = Enum.SortOrder.LayoutOrder; logLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
-
-local mutScroll = Instance.new("ScrollingFrame", main); mutScroll.Size = UDim2.new(0.9, 0, 0, 82); mutScroll.Position = UDim2.new(0.05, 0, 0, 38); mutScroll.BackgroundColor3 = Color3.fromRGB(20, 20, 20); mutScroll.ScrollBarThickness = 4
-local mutLayout = Instance.new("UIListLayout", mutScroll); mutLayout.Padding = UDim.new(0, 2)
-
-local footer = Instance.new("Frame", main); footer.Size = UDim2.new(1, 0, 0, 50); footer.Position = UDim2.new(0, 0, 1, -50); footer.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
-local btnAction = Instance.new("TextButton", footer); btnAction.Size = UDim2.new(0.55, 0, 0, 36); btnAction.Position = UDim2.new(0.05, 0, 0, 7); btnAction.Text = "INICIAR"; btnAction.BackgroundColor3 = Color3.fromRGB(0, 150, 50); btnAction.TextColor3 = Color3.new(1,1,1); btnAction.Font = Enum.Font.SourceSansBold
-local btnCopy = Instance.new("TextButton", footer); btnCopy.Size = UDim2.new(0.3, 0, 0, 36); btnCopy.Position = UDim2.new(0.65, 0, 0, 7); btnCopy.Text = "COPY"; btnCopy.BackgroundColor3 = Color3.fromRGB(60, 60, 60); btnCopy.TextColor3 = Color3.new(1,1,1); btnCopy.Font = Enum.Font.SourceSansBold
-
-local function refreshTitle()
-    local modeLabel = getActiveTargetMode() == "MUTATION"
-        and ("MUT " .. tostring(Config.Mutacion))
-        or "ATR AUTO"
-    title.Text = "V236 - " .. modeLabel
-end
-
-for i = 1, MAX_LOGS do
-    local lbl = Instance.new("TextLabel", logBox)
-    lbl.Size = UDim2.new(1, 0, 0, 14); lbl.BackgroundTransparency = 1; lbl.Text = ""
-    lbl.TextColor3 = Color3.new(1,1,1); lbl.TextSize = 9; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.LayoutOrder = i
-    UI.LogLabels[i] = lbl
-end
-
-function Logger:Log(msg, color)
-    local line = "["..os.date("%X").."] "..msg
-    self.Buffer[self.LogIndex] = line
-    self.LogIndex = (self.LogIndex % 400) + 1
-    
-    for i = 1, MAX_LOGS - 1 do
-        UI.LogLabels[i].Text = UI.LogLabels[i+1].Text; UI.LogLabels[i].TextColor3 = UI.LogLabels[i+1].TextColor3
-    end
-    UI.LogLabels[MAX_LOGS].Text = line; UI.LogLabels[MAX_LOGS].TextColor3 = color or Color3.new(1,1,1)
-    
-    logBox.CanvasSize = UDim2.new(0, 0, 0, logLayout.AbsoluteContentSize.Y)
-    logBox.CanvasPosition = Vector2.new(0, 99999)
-end
-
-function Logger:Dump(reason)
-    self:Log("!!! BLACKBOX DUMP: " .. reason, Color3.new(1, 0.3, 0.3))
-    for i = 1, 30 do
-        local index = (self.SnapIndex + i - 2) % 30 + 1
-        local s = self.Snapshots[index]
-        if s then
-            local stateA = s.anchored and "ANC" or "FREE"
-            self:Log(string.format("-- T-%.2fs | HP:%.0f | Y:%.1f | Vy:%.1f | Ph:%s | DXZ:%.1f | %s",
-                tick() - s.t, s.hp, s.y, s.vy, s.phase, s.distXZ, stateA), Color3.new(0.8, 0.8, 0.8))
-        end
-    end
-end
-
-function Logger:BuildCopyPayload()
-    local cleanBuffer = {}
-
-    if self.LastErrorLines and #self.LastErrorLines > 0 then
-        table.insert(cleanBuffer, "===== LAST_SCRIPT_ERROR =====")
-        for _, line in ipairs(self.LastErrorLines) do
-            table.insert(cleanBuffer, line)
-        end
-        table.insert(cleanBuffer, "===== LOG_BUFFER =====")
-    end
-
-    for i = 0, 399 do
-        local idx = ((self.LogIndex + i - 1) % 400) + 1
-        local line = self.Buffer[idx]
-        if line and line ~= "" then
-            table.insert(cleanBuffer, line)
-        end
-    end
-
-    return table.concat(cleanBuffer, "\n")
-end
-
--- ==============================================================================
--- 3. CAPA DE MOTOR FÍSICO Y GHOST MODE
--- ==============================================================================
-local Motor = { GhostCache = {} }
-local TargetCooldowns = setmetatable({}, { __mode = "k" })
-local FSM = {
-    Phase = "IDLE",
-    StateID = 0,
-    Session = 0,
-    SessionCarryCount = 0,
-    TargetRoot = nil,
-    TargetPrompt = nil,
-    EmergencyTicks = 0,
-    LastEmergencyAt = 0,
-    LastRespawnAt = 0,
-    DeadLatch = false,
-    PostTriggerRemovalExpected = false,
-    PendingCarrySwap = nil,
-    LastStartBlockLogAt = 0,
-    LastStabilityPos = nil,
-    PendingSafeRelease = false,
-    PendingSafeReleaseReason = nil,
-    LastReleaseAttemptAt = 0
-}
-
-local function GetPromptWorldPosition(prompt, fallback)
-    if not prompt then return fallback end
-
-    local parent = prompt.Parent
-    if parent then
-        if parent:IsA("Attachment") then
-            return parent.WorldPosition
-        end
-        if parent:IsA("BasePart") then
-            return parent.Position
-        end
-        if parent:IsA("Model") and parent.PrimaryPart then
-            return parent.PrimaryPart.Position
-        end
-    end
-
-    return fallback
-end
-
-local function GetBurstPickupCFrame(targetRoot, prompt)
-    local promptPos = GetPromptWorldPosition(prompt, targetRoot and targetRoot.Position or nil)
-    local fallenLimit = workspace.FallenPartsDestroyHeight or -500
-    local minSafeY = fallenLimit + 25
-    local referenceY = (Config.Home and Config.Home.Position.Y) or promptPos.Y
-    local transitDepthY = math.max(referenceY + (Config.BurstTransitDepth or 0), minSafeY)
-    local offsetY = promptPos.Y + (Config.BurstPromptRootOffset or 0)
-
-    -- El script que si funciona no se posiciona sobre el prompt; mantiene el HRP a profundidad de transito.
-    local burstY = math.min(offsetY, transitDepthY)
-
-    local burstPos = Vector3.new(promptPos.X, burstY, promptPos.Z)
-    local burstLook = Vector3.new(targetRoot.Position.X, burstY, targetRoot.Position.Z)
-    if (burstLook - burstPos).Magnitude < 0.01 then
-        burstLook = burstPos + Vector3.new(1, 0, 0)
-    end
-
-    return CFrame.lookAt(burstPos, burstLook), promptPos
-end
-
-local function GetRoutineSafeY()
-    return Config.Y_Transito + 1.25
-end
-
-function FSM:GetValidEntity()
-    local char = player.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not char or not hrp or not hum or hum.Health <= 0 then return nil end
-    return char, hrp, hum
-end
-
-function FSM:ClearTargets()
-    self.TargetRoot = nil
-    self.TargetPrompt = nil
-end
-
-function FSM:GetTargetCooldownRemaining(targetRoot, prompt)
-    local now = tick()
-    local rootUntil = (targetRoot and TargetCooldowns[targetRoot]) or 0
-    local promptUntil = (prompt and TargetCooldowns[prompt]) or 0
-    local expiresAt = math.max(rootUntil, promptUntil)
-    if expiresAt > now then
-        return expiresAt - now
-    end
-    return 0
-end
-
-function FSM:IsTargetCoolingDown(targetRoot, prompt)
-    return self:GetTargetCooldownRemaining(targetRoot, prompt) > 0
-end
-
-function FSM:MarkTargetCooldown(targetRoot, prompt, seconds, reason)
-    local cooldown = math.max(seconds or 0, 0)
-    if cooldown <= 0 then return end
-
-    local expiresAt = tick() + cooldown
-    if targetRoot then
-        TargetCooldowns[targetRoot] = math.max(TargetCooldowns[targetRoot] or 0, expiresAt)
-    end
-    if prompt then
-        TargetCooldowns[prompt] = math.max(TargetCooldowns[prompt] or 0, expiresAt)
-    end
-
-    Logger:Log(string.format("[TARGET_COOLDOWN] %.2fs (%s)", cooldown, tostring(reason or "n/a")), Color3.new(1, 0.7, 0))
-end
-
-local function GetOwnedToolCounts()
-    local total = 0
-    local totalByName = {}
-    local backpackByName = {}
-    local characterByName = {}
-    local backpack = player:FindFirstChildOfClass("Backpack")
-    local character = player.Character
-
-    local function collect(container, bucket)
-        if not container then return end
-        for _, child in ipairs(container:GetChildren()) do
-            if child:IsA("Tool") then
-                total += 1
-                bucket[child.Name] = (bucket[child.Name] or 0) + 1
-                totalByName[child.Name] = (totalByName[child.Name] or 0) + 1
-            end
-        end
-    end
-
-    collect(backpack, backpackByName)
-    collect(character, characterByName)
-
-    return {
-        total = total,
-        totalByName = totalByName,
-        backpackByName = backpackByName,
-        characterByName = characterByName,
-    }
-end
-
-local function GetOwnedToolTotal()
-    return GetOwnedToolCounts().total
-end
-
-local function GetPositiveToolDelta(beforeMap, afterMap)
-    local delta = 0
-    local names = {}
-
-    for name, afterCount in pairs(afterMap or {}) do
-        local beforeCount = (beforeMap and beforeMap[name]) or 0
-        if afterCount > beforeCount then
-            local diff = afterCount - beforeCount
-            delta += diff
-            table.insert(names, string.format("%s(+%d)", name, diff))
-        end
-    end
-
-    table.sort(names)
-    return delta, table.concat(names, ", ")
-end
-
-local function GetChildSignatureCounts(container)
-    local counts = {}
-    if not container then return counts end
-
-    for _, child in ipairs(container:GetChildren()) do
-        local key = string.format("%s|%s", child.ClassName, child.Name)
-        counts[key] = (counts[key] or 0) + 1
-    end
-
-    return counts
-end
-
-local function GetSignatureDelta(beforeMap, afterMap)
-    local names = {}
-
-    for key, afterCount in pairs(afterMap or {}) do
-        local beforeCount = (beforeMap and beforeMap[key]) or 0
-        if afterCount > beforeCount then
-            local diff = afterCount - beforeCount
-            table.insert(names, string.format("%s(+%d)", key, diff))
-        end
-    end
-
-    table.sort(names)
-    return #names > 0, table.concat(names, ", ")
-end
-
-local function IsCarryRelevantDescendant(instance)
-    if not instance then return false end
-    if instance:IsA("Tool") then
-        return true
-    end
-
-    local loweredName = string.lower(instance.Name)
-    if loweredName == "holdweld" or loweredName == "rightgrip" then
-        return true
-    end
-
-    if loweredName == "renderedbrainrot" or loweredName:find("brainrot", 1, true) or loweredName:find("carry", 1, true) then
-        return true
-    end
-
-    if instance:IsA("Weld") or instance:IsA("WeldConstraint") then
-        return loweredName == "holdweld" or loweredName == "rightgrip" or loweredName:find("brainrot", 1, true) or loweredName:find("carry", 1, true)
-    end
-
-    if instance:IsA("Model") then
-        return loweredName == "renderedbrainrot" or loweredName:find("brainrot", 1, true) or loweredName:find("carry", 1, true)
-    end
-
-    return false
-end
-
-local function GetRelevantDescendantSignatureCounts(container)
-    local counts = {}
-    if not container then return counts end
-
-    for _, descendant in ipairs(container:GetDescendants()) do
-        if IsCarryRelevantDescendant(descendant) then
-            local key = string.format("%s|%s", descendant.ClassName, descendant.Name)
-            counts[key] = (counts[key] or 0) + 1
-        end
-    end
-
-    return counts
-end
-
-local function FormatSignalCounts(signalMap, limit)
-    local items = {}
-    for key, count in pairs(signalMap or {}) do
-        if count > 1 then
-            table.insert(items, string.format("%s(x%d)", key, count))
-        else
-            table.insert(items, key)
-        end
-    end
-
-    table.sort(items)
-    if limit and #items > limit then
-        while #items > limit do
-            table.remove(items)
-        end
-    end
-    return table.concat(items, ", ")
-end
+	local node = target
+	while node and node ~= workspace do
+		local resolved = resolveRarityName(node.Name)
+		if rarityPriority[resolved] then
+			return resolved
+		end
+		node = node.Parent
+	end
+	return "Common"
+end
+
+local function getTargetPriority(target)
+	return rarityPriority[getTargetRarity(target)] or 0
+end
+
+local function parseLevelValue(value)
+	if type(value) == "number" then
+		return value
+	end
+	if type(value) == "string" then
+		return tonumber(string.match(value, "%d+"))
+	end
+	return nil
+end
+
+local function getTargetLevel(target)
+	if not target then
+		return 0
+	end
+
+	for _, attributeName in ipairs({"Level", "Lvl", "level", "lvl"}) do
+		local ok, value = pcall(function()
+			return target:GetAttribute(attributeName)
+		end)
+		if ok then
+			local parsed = parseLevelValue(value)
+			if parsed then
+				return parsed
+			end
+		end
+	end
+
+	for _, descendant in ipairs(target:GetDescendants()) do
+		local loweredName = string.lower(descendant.Name)
+		if loweredName == "level" or loweredName == "lvl" then
+			if descendant:IsA("IntValue") or descendant:IsA("NumberValue") then
+				return descendant.Value
+			elseif descendant:IsA("StringValue") then
+				local parsed = parseLevelValue(descendant.Value)
+				if parsed then
+					return parsed
+				end
+			end
+		end
+
+		if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
+			local parsed = parseLevelValue(descendant.Text)
+			if parsed then
+				return parsed
+			end
+		end
+	end
+
+	return 0
+end
+
+local function getTowerPriority(target)
+	local level = getTargetLevel(target)
+	if level >= towerMinLevel then
+		return 2, level
+	end
+	return 1, level
+end
+
+local function findPrompt(target)
+	if not target then
+		return nil
+	end
+
+	local prompt = target:FindFirstChildWhichIsA("ProximityPrompt", true)
+	if prompt then
+		return prompt
+	end
+
+	if target.Parent then
+		return target.Parent:FindFirstChildWhichIsA("ProximityPrompt", true)
+	end
+
+	return nil
+end
+
+local function isBrainrotCandidate(target)
+	if not target or not target:IsA("Model") then
+		return false
+	end
+
+	local loweredName = string.lower(target.Name)
+	if loweredName == "renderedbrainrot" or loweredName:find("brainrot", 1, true) then
+		return true
+	end
+
+	local parent = target.Parent
+	if parent then
+		local loweredParentName = string.lower(parent.Name)
+		if loweredParentName == "renderedbrainrot" or loweredParentName:find("brainrot", 1, true) then
+			return true
+		end
+	end
 
-local function GetEquippedTool(character)
-    if not character then return nil end
-    return character:FindFirstChildOfClass("Tool")
+	return false
 end
 
-local function LooksLikeGuid(text)
-    if type(text) ~= "string" then
-        return false
-    end
+local function getInvalidTargetReason(target)
+	if not target then
+		return "nil"
+	end
 
-    return string.match(text, "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") ~= nil
-end
-
-local function GetHomeStageCFrame(homeCF, yOffset)
-    if not homeCF then
-        return nil
-    end
-
-    local stagePos = homeCF.Position + Vector3.new(0, yOffset or 0, 0)
-    local flatLook = Vector3.new(homeCF.LookVector.X, 0, homeCF.LookVector.Z)
-    if flatLook.Magnitude < 0.01 then
-        flatLook = Vector3.new(0, 0, -1)
-    else
-        flatLook = flatLook.Unit
-    end
-
-    return CFrame.lookAt(stagePos, stagePos + flatLook)
-end
-
-local function ForceUnequipTools(humanoid)
-    if not humanoid then
-        return false
-    end
-
-    local equippedBefore = GetEquippedTool(player.Character)
-    pcall(function()
-        humanoid:UnequipTools()
-    end)
-
-    if not equippedBefore then
-        return true
-    end
-
-    local deadline = tick() + 0.35
-    while tick() < deadline do
-        if not GetEquippedTool(player.Character) then
-            return true
-        end
-        task.wait(0.05)
-    end
-
-    return GetEquippedTool(player.Character) == nil
-end
-
-local function TryUnequipEquippedTool(humanoid, reasonTag)
-    local liveChar = player.Character
-    local equippedTool = GetEquippedTool(liveChar)
-    if not humanoid or not equippedTool then
-        return false, nil
-    end
-
-    local toolName = tostring(equippedTool.Name)
-    local unequipped = ForceUnequipTools(humanoid)
-    if unequipped then
-        Logger:Log("[UNEQUIP_OK] " .. tostring(reasonTag or "n/a") .. ": " .. toolName, Color3.new(0, 1, 0))
-        return true, toolName
-    end
-
-    return false, toolName
-end
-
-local function GetLiveCarryState()
-    local liveChar = player.Character
-    if not liveChar then
-        return false, nil
-    end
-
-    local liveRoot = liveChar:FindFirstChild("HumanoidRootPart")
-    if liveRoot then
-        local holdWeld = liveRoot:FindFirstChild("HoldWeld")
-        if holdWeld and holdWeld:IsA("Weld") then
-            return true, "HOLD_WELD"
-        end
-    end
-
-    local rendered = liveChar:FindFirstChild("RenderedBrainrot") or liveChar:FindFirstChild("RenderedBrainrot", true)
-    if rendered and rendered:IsA("Model") then
-        return true, "RENDERED_BRAINROT"
-    end
-
-    local rightGrip = liveChar:FindFirstChild("RightGrip", true)
-    local equippedTool = GetEquippedTool(liveChar)
-    if rightGrip and rightGrip:IsA("Weld") and equippedTool then
-        if LooksLikeGuid(equippedTool.Name) then
-            return false, "EQUIPPED_UUID_TOOL:" .. tostring(equippedTool.Name)
-        end
-        return true, "RIGHT_GRIP:" .. tostring(equippedTool.Name)
-    end
-
-    return false, nil
-end
-
-function FSM:HasPendingCarrySwap()
-    return self.PendingCarrySwap ~= nil
-end
-
-function FSM:MarkCarrySwapPending(payload)
-    local pending = self.PendingCarrySwap or {}
-    pending.toolSnapshotBefore = (payload and payload.toolSnapshotBefore) or pending.toolSnapshotBefore
-    pending.characterChildrenBefore = (payload and payload.characterChildrenBefore) or pending.characterChildrenBefore
-    pending.characterDescendantsBefore = (payload and payload.characterDescendantsBefore) or pending.characterDescendantsBefore
-    pending.targetRoot = (payload and payload.targetRoot) or pending.targetRoot
-    pending.targetModel = (payload and payload.targetModel) or pending.targetModel
-    pending.prompt = (payload and payload.prompt) or pending.prompt
-    pending.claimReason = (payload and payload.claimReason) or pending.claimReason
-    pending.lossReason = (payload and payload.lossReason) or pending.lossReason
-    pending.markedAt = tick()
-
-    self.PendingCarrySwap = pending
-    self.PostTriggerRemovalExpected = true
-end
-
-function FSM:ClearPendingCarrySwap()
-    self.PendingCarrySwap = nil
-end
-
-function FSM:WaitForCarrySwapResolution()
-    local pending = self.PendingCarrySwap
-    if not pending or not pending.toolSnapshotBefore then
-        return false, "NO_PENDING_SWAP"
-    end
-
-    local function getSwapWorldClaimConfirmation()
-        local activeFolder = workspace:FindFirstChild("ActiveBrainrots")
-
-        if pending.targetRoot then
-            if activeFolder and not pending.targetRoot:IsDescendantOf(activeFolder) then
-                return true, "SWAP_CLAIM_WORLD_OK: target salio de ActiveBrainrots"
-            end
-            if not pending.targetRoot:IsDescendantOf(workspace) then
-                return true, "SWAP_TARGET_REMOVED_OK"
-            end
-        end
-
-        if pending.prompt then
-            if not pending.prompt:IsDescendantOf(workspace) then
-                return true, "SWAP_PROMPT_MISSING_OK"
-            end
-            if pending.targetModel and not pending.prompt:IsDescendantOf(pending.targetModel) then
-                return true, "SWAP_PROMPT_REPARENT_OK"
-            end
-            if activeFolder and not pending.prompt:IsDescendantOf(activeFolder) then
-                return true, "SWAP_PROMPT_FOLDER_EXIT_OK"
-            end
-        end
-
-        return false, nil
-    end
-
-    local function getSwapDirectCarryConfirmation(liveChar)
-        if not liveChar then return false, nil end
-
-        local liveRoot = liveChar:FindFirstChild("HumanoidRootPart")
-        if liveRoot then
-            local holdWeld = liveRoot:FindFirstChild("HoldWeld")
-            if holdWeld and holdWeld:IsA("Weld") then
-                return true, "SWAP_HOLD_WELD_OK"
-            end
-        end
-
-        local rendered = liveChar:FindFirstChild("RenderedBrainrot") or liveChar:FindFirstChild("RenderedBrainrot", true)
-        if rendered and rendered:IsA("Model") then
-            return true, "SWAP_RENDERED_OK"
-        end
-
-        local rightGrip = liveChar:FindFirstChild("RightGrip", true)
-        local equippedTool = GetEquippedTool(liveChar)
-        if rightGrip and rightGrip:IsA("Weld") and equippedTool then
-            return true, "SWAP_RIGHT_GRIP_OK: " .. tostring(equippedTool.Name)
-        end
-
-        if pending.targetRoot and pending.targetRoot:IsDescendantOf(liveChar) then
-            return true, "SWAP_TARGET_ON_CHAR_OK"
-        end
-
-        if pending.targetModel and pending.targetModel.Parent == liveChar then
-            return true, "SWAP_TARGET_MODEL_PARENT_CHAR_OK"
-        end
-
-        if pending.targetModel and pending.targetModel:IsDescendantOf(liveChar) then
-            return true, "SWAP_TARGET_MODEL_ON_CHAR_OK"
-        end
-
-        if pending.prompt and pending.prompt:IsDescendantOf(liveChar) then
-            if pending.prompt.Enabled == false then
-                return true, "SWAP_PROMPT_ON_CHAR_DISABLED_OK"
-            end
-            return true, "SWAP_PROMPT_ON_CHAR_OK"
-        end
-
-        return false, nil
-    end
-
-    local deadline = tick() + Config.CarrySwapResumeConfirmWindow
-    while tick() < deadline do
-        local worldOk, worldReason = getSwapWorldClaimConfirmation()
-        if worldOk then
-            return true, worldReason
-        end
-
-        local liveChar, _, _ = self:GetValidEntity()
-        if liveChar then
-            local directOk, directReason = getSwapDirectCarryConfirmation(liveChar)
-            if directOk then
-                return true, directReason
-            end
-
-            local toolSnapshotNow = GetOwnedToolCounts()
-            local equippedDelta, equippedNames = GetPositiveToolDelta(pending.toolSnapshotBefore.characterByName, toolSnapshotNow.characterByName)
-            if equippedDelta > 0 then
-                return true, "SWAP_TOOL_EQUIPPED_OK: " .. tostring(equippedNames ~= "" and equippedNames or equippedDelta)
-            end
-
-            local totalDelta, totalNames = GetPositiveToolDelta(pending.toolSnapshotBefore.totalByName, toolSnapshotNow.totalByName)
-            if totalDelta > 0 then
-                return true, "SWAP_TOOL_DELTA_OK: " .. tostring(totalNames ~= "" and totalNames or totalDelta)
-            end
-
-            local equippedTool = GetEquippedTool(liveChar)
-            local rightGrip = liveChar:FindFirstChild("RightGrip", true)
-            if equippedTool and rightGrip and rightGrip:IsA("Weld") then
-                local beforeCount = (pending.toolSnapshotBefore.totalByName and pending.toolSnapshotBefore.totalByName[equippedTool.Name]) or 0
-                local afterCount = (toolSnapshotNow.totalByName and toolSnapshotNow.totalByName[equippedTool.Name]) or 0
-                if afterCount > beforeCount then
-                    return true, "SWAP_RIGHT_GRIP_OK: " .. tostring(equippedTool.Name)
-                end
-            end
-
-            local hasDescDelta, descDeltaNames = GetSignatureDelta(pending.characterDescendantsBefore, GetRelevantDescendantSignatureCounts(liveChar))
-            if hasDescDelta then
-                return true, "SWAP_CHAR_DESC_OK: " .. tostring(descDeltaNames)
-            end
-
-            local hasChildDelta, childDeltaNames = GetSignatureDelta(pending.characterChildrenBefore, GetChildSignatureCounts(liveChar))
-            if hasChildDelta then
-                return true, "SWAP_CHAR_ATTACH_OK: " .. tostring(childDeltaNames)
-            end
-        end
-
-        task.wait(0.10)
-    end
-
-    return false, "SWAP_NO_TOOL_CONFIRM"
-end
-
-function FSM:RequestSafeRelease(reason)
-    if self.DeadLatch or self.Phase == "DEAD" then
-        return
-    end
-
-    self.PendingSafeRelease = true
-    self.PendingSafeReleaseReason = reason or "Deferred Release"
-end
-
-function FSM:IsHomeCFrameSafe(homeCF)
-    return homeCF and homeCF.Position.Y > (Config.Y_Transito + Config.HomeSafetyMargin)
-end
-
-function FSM:CheckStabilitySample(hrp, hum, previousPos, opts)
-    opts = opts or {}
-
-    if not hrp or not hrp.Parent or not hum or hum.Health <= 0 then
-        return false, "NO_ENTITY", previousPos
-    end
-
-    local minY = opts.minY or (Config.Y_Transito + 1.0)
-    local minHealth = opts.minHealth or Config.MinRecoverHealth
-    local requireAnchored = opts.requireAnchored == true
-    local vy = math.abs(hrp.AssemblyLinearVelocity.Y)
-    local pos = hrp.Position
-    local delta = previousPos and (pos - previousPos).Magnitude or 0
-
-    if requireAnchored and not hrp.Anchored then
-        return false, "NOT_ANCHORED", pos
-    end
-    if pos.Y <= minY then
-        return false, "LOW_Y", pos
-    end
-    if hum.Health < minHealth then
-        return false, "LOW_HP", pos
-    end
-    if vy > Config.StableVyEpsilon then
-        return false, "HIGH_VY", pos
-    end
-    if previousPos and delta > Config.StablePosEpsilon then
-        return false, "POS_DRIFT", pos
-    end
-
-    return true, "STABLE", pos
-end
-
-function FSM:WaitForStableWindow(requiredFrames, opts)
-    local stableFrames = 0
-    local missingFrames = 0
-    local previousPos = nil
-    local maxFrames = (opts and opts.maxFrames) or math.max(requiredFrames * 5, requiredFrames + 8)
-    local allowMissingEntityFrames = (opts and opts.allowMissingEntityFrames) or 0
-    local lastReason = "INIT"
-
-    for _ = 1, maxFrames do
-        local _, hrp, hum = self:GetValidEntity()
-        if not hrp or not hum then
-            stableFrames = 0
-            missingFrames += 1
-            lastReason = "NO_ENTITY"
-            if missingFrames > allowMissingEntityFrames then
-                return false, "NO_ENTITY"
-            end
-            RS.Heartbeat:Wait()
-            continue
-        end
-
-        missingFrames = 0
-
-        local ok, reason, nextPos = self:CheckStabilitySample(hrp, hum, previousPos, opts)
-        previousPos = nextPos
-        if ok then
-            stableFrames += 1
-            if stableFrames >= requiredFrames then
-                return true, "STABLE"
-            end
-        else
-            stableFrames = 0
-            lastReason = reason
-        end
-
-        RS.Heartbeat:Wait()
-    end
-
-    return false, lastReason
-end
+	if blacklist[target] then
+		return "blacklist"
+	end
 
-function FSM:IsRoutineBlocked()
-    local now = tick()
-
-    if self.DeadLatch or self.Phase == "DEAD" then
-        return true, "DEAD_LATCH"
-    end
-    if (now - (self.LastRespawnAt or 0)) < Config.RespawnGuardSeconds then
-        return true, "RESPAWN_GUARD"
-    end
-    if (now - (self.LastEmergencyAt or 0)) < Config.EmergencyGuardSeconds then
-        return true, "EMERGENCY_GUARD"
-    end
-
-    local _, hrp, hum = self:GetValidEntity()
-    if not hrp or not hum then
-        return true, "NO_ENTITY"
-    end
-
-    local equippedTool = GetEquippedTool(player.Character)
-    if equippedTool then
-        local clearedTool = TryUnequipEquippedTool(hum, "START")
-        if clearedTool then
-            equippedTool = GetEquippedTool(player.Character)
-        end
-    end
-
-    local carryActive, carryReason = GetLiveCarryState()
-    if carryActive then
-        return true, "CARRY_ACTIVE_" .. tostring(carryReason)
-    end
-    if equippedTool then
-        if LooksLikeGuid(equippedTool.Name) then
-            return false, "UUID_TOOL_IGNORED"
-        end
-        return true, "TOOL_EQUIPPED_" .. tostring(equippedTool.Name)
-    end
-    if hum.Health < Config.MinStartHealth then
-        return true, "LOW_HP_START"
-    end
-
-    local stable, reason = self:CheckStabilitySample(hrp, hum, nil, {
-        minY = Config.Y_Transito + 1.0,
-        minHealth = Config.MinStartHealth,
-        requireAnchored = true
-    })
-    if not stable then
-        return true, reason
-    end
-
-    return false, "READY"
-end
-
-function FSM:GetSessionCarryCount()
-    return math.max(self.SessionCarryCount or 0, 0)
-end
+	if not target:IsDescendantOf(workspace) then
+		return "not_in_workspace"
+	end
 
-function FSM:HasStoredSessionCarry()
-    return self:GetSessionCarryCount() > 0
-end
+	if not target:IsA("Model") then
+		return "not_model"
+	end
 
-function FSM:ResetSessionCarry(reason)
-    local previous = self:GetSessionCarryCount()
-    self.SessionCarryCount = 0
+	if not findPrompt(target) then
+		return "no_prompt"
+	end
 
-    if previous > 0 and reason then
-        Logger:Log(string.format("[SESSION_CARRY_RESET] %s prev=%d", tostring(reason), previous), Color3.new(0, 1, 1))
-    end
+	return nil
 end
 
-function FSM:RecordSessionPickup(reason)
-    self.SessionCarryCount = self:GetSessionCarryCount() + 1
-    Logger:Log(string.format("[SESSION_CARRY] %d/%d (%s)", self.SessionCarryCount, math.max(Config.ReturnAt or 1, 1), tostring(reason or "pickup")), Color3.new(0, 1, 1))
-    return self.SessionCarryCount
+local function isValidTarget(target)
+	return getInvalidTargetReason(target) == nil
 end
 
-function FSM:HandleBurstSoftReset(reason)
-    local liveChar, liveRoot, liveHum = self:GetValidEntity()
-    if liveChar and liveRoot then
-        if liveHum and liveHum.Health < Config.MinStartHealth and self:IsHomeCFrameSafe(Config.Home) then
-            self:RecoverToSafeHome(liveRoot, liveChar)
-            Logger:Log(string.format("[BURST_SOFT_RECOVER_HOME] hp=%.1f", liveHum.Health), Color3.new(1, 0.8, 0))
-        else
-            local flatLook = Vector3.new(liveRoot.CFrame.LookVector.X, 0, liveRoot.CFrame.LookVector.Z)
-            if flatLook.Magnitude < 0.01 then
-                flatLook = Vector3.new(0, 0, -1)
-            else
-                flatLook = flatLook.Unit
-            end
-
-            local resetPos = Vector3.new(liveRoot.Position.X, math.max(liveRoot.Position.Y, GetRoutineSafeY()), liveRoot.Position.Z)
-            local resetCF = CFrame.lookAt(resetPos, resetPos + flatLook)
-            Motor:TeleportCharacter(liveChar, liveRoot, resetCF, true)
-            Logger:Log(string.format("[BURST_LOCAL_RESET] y=%.2f", resetPos.Y), Color3.new(1, 0.8, 0))
-        end
-    end
-
-    Logger:Log("[BURST_SOFT_RESET] " .. tostring(reason), Color3.new(1, 0.6, 0))
-    self:TransitionTo("IDLE", "Burst Soft Reset")
-end
+local function getTargetPosition(target)
+	local ok, pivot = pcall(function()
+		return target:GetPivot()
+	end)
 
-function FSM:WaitForFieldPickupStow()
-    local deadline = tick() + math.max(Config.PostPickupFieldWindow or 0, 0)
-    local lastUnequipAt = 0
-
-    while tick() < deadline do
-        local liveChar, liveRoot, liveHum = self:GetValidEntity()
-        if not liveChar or not liveRoot or not liveHum then
-            return false, "NO_ENTITY"
-        end
-
-        Motor:SealCharacter(liveRoot)
-        local flatLook = Vector3.new(liveRoot.CFrame.LookVector.X, 0, liveRoot.CFrame.LookVector.Z)
-        if flatLook.Magnitude < 0.01 then
-            flatLook = Vector3.new(0, 0, -1)
-        else
-            flatLook = flatLook.Unit
-        end
-        local safeY = math.max(liveRoot.Position.Y, GetRoutineSafeY())
-        if math.abs(liveRoot.Position.Y - safeY) > 0.05 then
-            local safePos = Vector3.new(liveRoot.Position.X, safeY, liveRoot.Position.Z)
-            pcall(function()
-                liveChar:PivotTo(CFrame.lookAt(safePos, safePos + flatLook))
-            end)
-        end
-        Motor:StopMotion(liveRoot)
-
-        local carryActive, carryReason = GetLiveCarryState()
-        local equippedTool = GetEquippedTool(liveChar)
-        if (carryActive or equippedTool) and (tick() - lastUnequipAt) >= (Config.ReturnUnequipEvery or 0.20) then
-            lastUnequipAt = tick()
-            ForceUnequipTools(liveHum)
-            carryActive, carryReason = GetLiveCarryState()
-            equippedTool = GetEquippedTool(liveChar)
-        end
-
-        if not carryActive then
-            if equippedTool and LooksLikeGuid(equippedTool.Name) then
-                ForceUnequipTools(liveHum)
-                equippedTool = GetEquippedTool(liveChar)
-            end
-
-            if not equippedTool then
-                return true, "FIELD_STOW_CLEAR"
-            end
-
-            if equippedTool and LooksLikeGuid(equippedTool.Name) then
-                return true, "FIELD_STOW_UUID"
-            end
-        end
-
-        task.wait(Config.PostPickupFieldPoll or 0.05)
-    end
-
-    local carryActive, carryReason = GetLiveCarryState()
-    if not carryActive then
-        local _, _, liveHum = self:GetValidEntity()
-        if liveHum then
-            ForceUnequipTools(liveHum)
-        end
-
-        local equippedTool = GetEquippedTool(player.Character)
-        if not equippedTool or LooksLikeGuid(equippedTool.Name) then
-            return true, "FIELD_STOW_LATE"
-        end
-    end
-
-    return false, carryReason or "FIELD_STOW_TIMEOUT"
-end
+	if ok and pivot then
+		return pivot.Position
+	end
 
-function FSM:RunHomeReturn(targetRoot, prompt, transitionReason, cooldownReason)
-    self:TransitionTo("RETURN", transitionReason or "Safe Extract")
-
-    local _, hrpAfter = self:GetValidEntity()
-    if not hrpAfter then
-        if self.Phase == "RETURN" then self:TransitionTo("EMERGENCY", "POST_RETURN_NO_ENTITY") end
-        return false, "NO_ENTITY"
-    end
-    if not self:IsHomeCFrameSafe(Config.Home) then
-        if self.Phase == "RETURN" then self:TransitionTo("EMERGENCY", "HOME_INVALID") end
-        return false, "HOME_INVALID"
-    end
-
-    local clearedCarry, carryClearReason = self:ExecuteHomeUnloadSequence()
-    if not clearedCarry and (carryClearReason == "HOME_INVALID" or carryClearReason == "NO_ENTITY") then
-        if self.Phase == "RETURN" then self:TransitionTo("EMERGENCY", carryClearReason) end
-        return false, carryClearReason
-    end
-    if clearedCarry then
-        Logger:Log("[RETURN_CLEAR] carry descargado", Color3.new(0, 1, 0))
-        local _, _, clearHum = self:GetValidEntity()
-        if clearHum then
-            TryUnequipEquippedTool(clearHum, cooldownReason or "RETURN_CLEAR")
-        end
-        self:ResetSessionCarry(cooldownReason or "RETURN_CLEAR")
-    else
-        Logger:Log("[RETURN_CLEAR_PENDING] " .. tostring(carryClearReason), Color3.new(1, 0.8, 0))
-    end
-    self:MarkTargetCooldown(targetRoot, prompt, Config.TargetSuccessCooldown, clearedCarry and (cooldownReason or "SUCCESS_SETTLE") or ("SUCCESS_PENDING_" .. tostring(carryClearReason)))
-
-    self:TransitionTo("IDLE", clearedCarry and "Farm Success" or "Return Pending")
-    local _, safeRoot = self:GetValidEntity()
-    if safeRoot then
-        Motor:SealCharacter(safeRoot)
-    end
-    if not Config.Activo then
-        self:ReleaseCharacterIfSafe(clearedCarry and "Farm Success" or "Return Pending")
-    elseif not clearedCarry then
-        Logger:Log("[CYCLE_BLOCKED] esperando descarga home", Color3.new(1, 0.8, 0))
-    else
-        Logger:Log("[CYCLE_READY_SEALED]", Color3.new(0, 1, 0))
-    end
-
-    return clearedCarry, carryClearReason
-end
+	if not ok then
+		debugLog("TARGET_ERROR", "GetPivot fallo para " .. tostring(target and target:GetFullName() or "nil"))
+	end
 
-function FSM:WaitForCarryClearWindow(hoverCFrame)
-    local carryActive, carryReason = GetLiveCarryState()
-    if not carryActive then
-        return true, "CLEAR"
-    end
-
-    local deadline = tick() + math.max(Config.CarryClearHomeWindow or 0, 0)
-    local lastUnequipAt = 0
-    local touchWindowArmed = false
-
-    while tick() < deadline do
-        local liveChar, liveRoot, liveHum = self:GetValidEntity()
-        if not liveChar or not liveRoot or not liveHum then
-            return false, "NO_ENTITY"
-        end
-
-        if hoverCFrame then
-            if Config.ReturnTouchWindow then
-                Motor:SetGhostTouchWindow(true)
-                touchWindowArmed = true
-            end
-
-            if Config.ReturnHoverFree then
-                if liveRoot.Anchored then
-                    Motor:ReleaseCharacter(liveRoot)
-                end
-                pcall(function()
-                    liveChar:PivotTo(hoverCFrame)
-                end)
-                Motor:StopMotion(liveRoot)
-            else
-                Motor:TeleportCharacter(liveChar, liveRoot, hoverCFrame, true)
-            end
-
-            if Config.ReturnForceUnequip and (tick() - lastUnequipAt) >= (Config.ReturnUnequipEvery or 0.20) then
-                lastUnequipAt = tick()
-                ForceUnequipTools(liveHum)
-            end
-        end
-
-        carryActive, carryReason = GetLiveCarryState()
-        if not carryActive then
-            if touchWindowArmed then
-                Motor:SetGhostTouchWindow(false)
-            end
-            local _, endRoot = self:GetValidEntity()
-            if endRoot then
-                Motor:SealCharacter(endRoot)
-            end
-            return true, "CLEAR"
-        end
-        task.wait(Config.CarryClearPoll or 0.05)
-    end
-
-    if touchWindowArmed then
-        Motor:SetGhostTouchWindow(false)
-    end
-    local endChar, endRoot = self:GetValidEntity()
-    if endChar and endRoot and hoverCFrame then
-        pcall(function()
-            endChar:PivotTo(hoverCFrame)
-        end)
-        Motor:StopMotion(endRoot)
-        Motor:SealCharacter(endRoot)
-    end
-
-    return false, carryReason or "CARRY_STILL_ACTIVE"
+	return nil
 end
 
-function FSM:ExecuteHomeUnloadSequence()
-    if not self:IsHomeCFrameSafe(Config.Home) then
-        return false, "HOME_INVALID"
-    end
-
-    local tunnelStage = GetHomeStageCFrame(Config.Home, Config.ReturnApproachDepth)
-    local settleStage = GetHomeStageCFrame(Config.Home, Config.ReturnSettleDepth)
-    local hoverStage = GetHomeStageCFrame(Config.Home, Config.ReturnHoverDepth)
-    local stageDelay = math.max(Config.ReturnStageDelay or 0, 0)
-    local stages = {
-        { name = "TUNNEL", cframe = tunnelStage, anchored = true },
-        { name = "SETTLE", cframe = settleStage, anchored = true },
-        { name = "HOVER", cframe = hoverStage, anchored = not Config.ReturnHoverFree },
-    }
-
-    Logger:Log("[RETURN_MODE] HOME_UNLOAD_STAGES", Color3.new(0, 1, 1))
-
-    for _, stage in ipairs(stages) do
-        local liveChar, liveRoot = self:GetValidEntity()
-        if not liveChar or not liveRoot then
-            return false, "NO_ENTITY"
-        end
-
-        if stage.name == "HOVER" and Config.ReturnTouchWindow then
-            Motor:SetGhostTouchWindow(true)
-            Logger:Log("[RETURN_TOUCH_WINDOW] canTouch=ON", Color3.new(0, 1, 1))
-        end
-
-        Motor:TeleportCharacter(liveChar, liveRoot, stage.cframe, stage.anchored)
-        Logger:Log(string.format("[RETURN_STAGE] %s y=%.2f anchored=%s", stage.name, stage.cframe.Position.Y, tostring(stage.anchored)), Color3.new(0, 1, 1))
-
-        if stageDelay > 0 then
-            task.wait(stageDelay)
-        end
-    end
-
-    return self:WaitForCarryClearWindow(hoverStage)
-end
+local function isPreferredLiveTarget(target)
+	if not target or not target:IsDescendantOf(workspace) then
+		return false
+	end
 
-function Motor:StopMotion(hrp)
-    if not hrp then return end
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
-end
+	local brainrots = workspace:FindFirstChild("ActiveBrainrots")
+	if brainrots then
+		return target:IsDescendantOf(brainrots)
+	end
 
-function Motor:SetAnchored(hrp, anchored)
-    if not hrp then return end
-    self:StopMotion(hrp)
-    hrp.Anchored = anchored and true or false
-    if anchored then
-        self:StopMotion(hrp)
-    end
+	return true
 end
 
-function Motor:SealCharacter(hrp)
-    self:SetAnchored(hrp, true)
-end
+local function engageAutopilot(reason, status)
+	local humanoid = getHumanoid()
+	local root = getRoot()
+	if not humanoid or not root then
+		debugLog("AUTOPILOT_FAIL", "sin humanoid o root")
+		return false
+	end
 
-function Motor:ReleaseCharacter(hrp)
-    self:SetAnchored(hrp, false)
-end
+	if not autoPilot then
+		flyValue.Value = root.CFrame
+	end
 
-function Motor:TeleportCharacter(char, hrp, targetCFrame, anchoredAfter)
-    if not char or not hrp or not targetCFrame then return false end
-    self:SealCharacter(hrp)
-    char:PivotTo(targetCFrame)
-    RS.Heartbeat:Wait()
-    self:StopMotion(hrp)
-    hrp.Anchored = anchoredAfter ~= false
-    return true
-end
+	autoPilot = true
+	humanoid.PlatformStand = true
 
-function Motor:GetBurstHoverRig(hrp)
-    if not hrp then
-        return nil, nil
-    end
+	if reason then
+		status.Text = reason
+	end
+	debugLog("AUTOPILOT_ON", reason or "sin motivo")
+	if mainButton then
+		updateButtonState(mainButton)
+	end
 
-    return hrp:FindFirstChild("IvanBurstHoverAttachment"), hrp:FindFirstChild("IvanBurstHoverAlign")
+	return true
 end
 
-function Motor:DestroyBurstHoverRig(hrp)
-    local attachment, align = self:GetBurstHoverRig(hrp)
-    if align then
-        align:Destroy()
-    end
-    if attachment then
-        attachment:Destroy()
-    end
-end
+local function appendTargetIfValid(container, target)
+	if not target then
+		return
+	end
 
-function Motor:EnsureBurstHoverRig(hrp)
-    if not hrp then
-        return nil, nil
-    end
-
-    local attachment, align = self:GetBurstHoverRig(hrp)
-    if not attachment then
-        attachment = Instance.new("Attachment")
-        attachment.Name = "IvanBurstHoverAttachment"
-        attachment.Parent = hrp
-    end
-    if not align then
-        align = Instance.new("AlignPosition")
-        align.Name = "IvanBurstHoverAlign"
-        align.Mode = Enum.PositionAlignmentMode.OneAttachment
-        align.Attachment0 = attachment
-        align.ApplyAtCenterOfMass = true
-        align.RigidityEnabled = false
-        align.MaxVelocity = Config.BurstHoverMaxVelocity
-        align.Responsiveness = Config.BurstHoverResponsiveness
-        align.MaxForce = Config.BurstHoverMaxForce
-        align.Parent = hrp
-    end
-
-    return attachment, align
-end
+	local invalidReason = getInvalidTargetReason(target)
+	if invalidReason then
+		return
+	end
 
-function Motor:SetGhostMode(enable)
-    local char = FSM:GetValidEntity()
-    if not char then return end
-    if enable then
-        table.clear(self.GhostCache)
-        for _, part in ipairs(char:GetDescendants()) do
-            if part:IsA("BasePart") and part.CanCollide then
-                self.GhostCache[part] = { CanCollide = part.CanCollide, CanTouch = part.CanTouch }
-                part.CanCollide = false; part.CanTouch = false
-            end
-        end
-    else
-        for part, props in pairs(self.GhostCache) do
-            if part and part.Parent then
-                part.CanCollide = props.CanCollide; part.CanTouch = props.CanTouch
-            end
-        end
-        table.clear(self.GhostCache)
-    end
-end
+	for _, existing in ipairs(container) do
+		if existing == target then
+			return
+		end
+	end
 
-function Motor:SetGhostTouchWindow(enabled)
-    for part, _ in pairs(self.GhostCache) do
-        if part and part.Parent then
-            part.CanCollide = false
-            part.CanTouch = enabled and true or false
-        end
-    end
+	table.insert(container, target)
 end
 
--- ==============================================================================
--- 4. FUNCIONES DE RECUPERACIÓN Y SEGURIDAD (LAS QUE PEDISTE)
--- ==============================================================================
-function FSM:ReleaseCharacterIfSafe(context)
-    local char, hrp, hum = self:GetValidEntity()
-    if not hrp then return false, "NO_ENTITY" end
-
-    if self.Phase ~= "IDLE" then
-        Logger:Log("[RELEASE_BLOCKED] Phase=" .. self.Phase, Color3.new(1, 0.5, 0))
-        return false, "PHASE_" .. self.Phase
-    end
-
-    if self.DeadLatch then
-        Logger:Log("[RELEASE_BLOCKED] DEAD_LATCH", Color3.new(1, 0.3, 0.3))
-        return false, "DEAD_LATCH"
-    end
-
-    if (tick() - (self.LastRespawnAt or 0)) < Config.RespawnGuardSeconds then
-        Logger:Log("[RELEASE_BLOCKED] RESPAWN_GUARD", Color3.new(1, 0.5, 0))
-        return false, "RESPAWN_GUARD"
-    end
-
-    if (tick() - (self.LastEmergencyAt or 0)) < Config.EmergencyGuardSeconds then
-        Logger:Log("[RELEASE_BLOCKED] EMERGENCY_GUARD", Color3.new(1, 0.5, 0))
-        return false, "EMERGENCY_GUARD"
-    end
-
-    local ok, reason = self:WaitForStableWindow(Config.ReleaseStableFrames, {
-        minY = Config.Y_Transito + 1.0,
-        minHealth = Config.MinRecoverHealth,
-        requireAnchored = true,
-        maxFrames = 48
-    })
-
-    if ok then
-        Motor:ReleaseCharacter(hrp)
-        self.PendingSafeRelease = false
-        self.PendingSafeReleaseReason = nil
-        Logger:Log("[RELEASE_OK] " .. tostring(context), Color3.new(0, 1, 0))
-        return true, "OK"
-    else
-        Motor:SealCharacter(hrp)
-        Logger:Log("[RELEASE_BLOCKED] " .. tostring(reason), Color3.new(1, 0.5, 0))
-        return false, reason
-    end
-end
+local function noteScanReason(reasonCounts, reason)
+	if not reason then
+		return
+	end
 
-function FSM:SaveHomeIfSafe(hrp)
-    local ok, reason = self:WaitForStableWindow(Config.HomeStableFrames, {
-        minY = Config.Y_Transito + Config.HomeSafetyMargin,
-        minHealth = Config.MinRecoverHealth,
-        requireAnchored = true,
-        maxFrames = 36
-    })
-
-    if ok then
-        Config.Home = hrp.CFrame
-        Logger:Log("Home Fijado: Y=" .. string.format("%.1f", Config.Home.Y), Color3.new(0, 1, 0))
-    else
-        Logger:Log("[HOME_REJECTED] " .. tostring(reason), Color3.new(1, 0.5, 0))
-    end
+	reasonCounts[reason] = (reasonCounts[reason] or 0) + 1
 end
 
-function FSM:RecoverToSafeHome(hrp, char)
-    Motor:SealCharacter(hrp)
-    if self:IsHomeCFrameSafe(Config.Home) then
-        Motor:TeleportCharacter(char, hrp, Config.Home + Vector3.new(0, 3, 0), true)
-        Logger:Log("[RECOVERY] Teleport a Home Seguro", Color3.new(0, 1, 1))
-    else
-        Motor:TeleportCharacter(char, hrp, hrp.CFrame + Vector3.new(0, math.abs(hrp.Position.Y) + 15, 0), true)
-        Logger:Log("[RECOVERY_FALLBACK] Teleport hacia arriba", Color3.new(1, 0.5, 0))
-    end
-end
+local function formatReasonCounts(reasonCounts)
+	local orderedReasons = {"no_prompt", "blacklist", "not_in_workspace", "not_model", "nil"}
+	local parts = {}
+	local seen = {}
 
-function FSM:StopSafely()
-    if self.DeadLatch or self.Phase == "DEAD" then
-        Logger:Log("[STOP_BLOCKED] DEAD terminal hasta respawn estable", Color3.new(1, 0.3, 0.3))
-        return
-    end
-
-    local char, hrp, hum = self:GetValidEntity()
-    if hrp then
-        if hrp.Position.Y <= (Config.Y_Transito + 1.0) then
-            Logger:Log("[STOP] Subterráneo detectado. Rescatando...", Color3.new(1, 0.5, 0))
-            self:RecoverToSafeHome(hrp, char)
-        else
-            Motor:SealCharacter(hrp)
-        end
-    end
-    self:TransitionTo("IDLE", "Manual Stop")
-    if hum and hum.Health >= Config.MinStartHealth then
-        local released = self:ReleaseCharacterIfSafe("Manual Stop")
-        if not released then
-            self:RequestSafeRelease("Manual Stop Deferred")
-        end
-    else
-        self:RequestSafeRelease("Manual Stop Low HP")
-        Logger:Log("[STOP_SEALED_LOW_HP]", Color3.new(1, 0.5, 0))
-    end
-end
+	for _, reason in ipairs(orderedReasons) do
+		if reasonCounts[reason] then
+			table.insert(parts, reason .. "=" .. tostring(reasonCounts[reason]))
+			seen[reason] = true
+		end
+	end
 
-function FSM:TransitionTo(newPhase, reason, extraCFrame)
-    if self.Phase == newPhase then return end
-
-    if self.Phase == "DEAD" and newPhase ~= "DEAD" and reason ~= "CharacterAdded Stable" and reason ~= "Cleanup" then
-        Logger:Log("[FSM_BLOCKED] DEAD terminal -> " .. newPhase, Color3.new(1, 0.3, 0.3))
-        return
-    end
-
-    Logger:Log(string.format("[FSM] %s -> %s (%s)", self.Phase, newPhase, reason or "Auto"), Color3.fromRGB(150, 150, 250))
-    
-    self.Phase = newPhase
-    self.StateID = self.StateID + 1 
-    self.LastStabilityPos = nil
-    
-    if newPhase == "IDLE" or newPhase == "EMERGENCY" or newPhase == "DEAD" then
-        Motor:SetGhostMode(false)
-    end
-    
-    if newPhase == "IDLE" then 
-        self:ClearTargets()
-        self.EmergencyTicks = 0
-        if not Config.Activo and not self.DeadLatch then
-            self:RequestSafeRelease(reason or "IDLE")
-        end
-    elseif newPhase == "FLASH_EXIT" then
-        local char, hrp = self:GetValidEntity()
-        if hrp and extraCFrame then
-            Motor:TeleportCharacter(char, hrp, extraCFrame, true)
-        end
-    elseif newPhase == "EMERGENCY" then
-        self:ClearTargets()
-        self.EmergencyTicks = 0
-        self.LastEmergencyAt = tick()
-        local char, hrp = self:GetValidEntity()
-        if hrp then
-            self:RecoverToSafeHome(hrp, char)
-            Logger:Log("[TELEMETRY] EMERGENCY Latch Activo", Color3.new(1, 0, 0))
-        end
-    elseif newPhase == "RETURN" then
-        self:ClearTargets()
-    elseif newPhase == "DEAD" then
-        self:ClearTargets()
-        self.DeadLatch = true
-        self.EmergencyTicks = 0
-    end 
-end
+	for reason, count in pairs(reasonCounts) do
+		if not seen[reason] then
+			table.insert(parts, reason .. "=" .. tostring(count))
+		end
+	end
 
--- ==============================================================================
--- 5. LÓGICA DE VIAJE Y BURST
--- ==============================================================================
-function Motor:Travel(targetCF, expectedToken)
-    local char, hrp = FSM:GetValidEntity()
-    if not hrp then return false, "NO_ENTITY" end
-
-    Motor:SealCharacter(hrp)
-    
-    local startCF = hrp.CFrame 
-    local dist = (Vector2.new(startCF.X, startCF.Z) - Vector2.new(targetCF.X, targetCF.Z)).Magnitude 
-    local duration = math.max(dist / Config.Velocidad, 0.1) 
-    local startTime = tick() 
-    local status = "PENDING" 
-    
-    local conn
-    conn = RS.RenderStepped:Connect(function() 
-        if not Config.Activo then
-            status = "ABORTED_MANUAL"
-            return
-        end
-        if FSM.StateID ~= expectedToken then
-            status = "STATE_OVERRIDDEN"
-            return
-        end
-        if not FSM:GetValidEntity() then
-            status = "NO_ENTITY"
-            return
-        end
-        local elapsed = tick() - startTime 
-        local alpha = math.clamp(elapsed / duration, 0, 1) 
-        hrp.CFrame = startCF:Lerp(targetCF, alpha) 
-        Motor:StopMotion(hrp)
-        if alpha >= 1 then status = "OK" end 
-    end) 
-    
-    local timeout = duration + 2
-    while status == "PENDING" and (tick() - startTime) < timeout do RS.Heartbeat:Wait() end 
-    if conn then conn:Disconnect() end 
-    if status == "PENDING" then status = "TIMEOUT" end
-    
-    return status == "OK", status 
+	return #parts > 0 and table.concat(parts, ",") or "none"
 end
 
-function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
-    local char, hrp, hum = FSM:GetValidEntity()
-    if not hrp then return false, "NO_ENTITY" end
-    if not prompt or not prompt:IsDescendantOf(workspace) then return false, "NO_PROMPT" end
-
-    local tempConnections = {}
-    local triggeredObserved = false
-    local interactionObserved = false
-    local promptHiddenObserved = false
-    local promptHiddenObservedAt = 0
-    local promptHiddenAfterInteractionAt = 0
-    local postTriggerMicroReleaseDone = false
-    local claimObservedAt = 0
-    local lastConfirmRefireAt = 0
-    local lastBurstPoseMode = nil
-    local lastInteractionAt = 0
-    local triggeredObservedAt = 0
-    local hoverHoldLogged = false
-    local targetContainer = targetRoot and targetRoot.Parent or nil
-    local targetModel = targetContainer and targetContainer:IsA("Model") and targetContainer or nil
-    local activeBrainrots = workspace:FindFirstChild("ActiveBrainrots")
-    local toolSnapshotBefore = GetOwnedToolCounts()
-    local characterChildrenBefore = GetChildSignatureCounts(char)
-    local characterDescendantsBefore = GetRelevantDescendantSignatureCounts(char)
-    local burstSignals = {
-        claimSeen = false,
-        claimReason = nil,
-        charAdded = {},
-        charRemoved = {},
-        descAdded = {},
-        descRemoved = {},
-        toolAdded = {},
-        toolRemoved = {},
-    }
-    local promptPropsBefore = {
-        RequiresLineOfSight = prompt.RequiresLineOfSight,
-        MaxActivationDistance = prompt.MaxActivationDistance,
-        HoldDuration = prompt.HoldDuration,
-    }
-    local burstHumanoidPropsBefore = hum and {
-        PlatformStand = hum.PlatformStand,
-        AutoRotate = hum.AutoRotate,
-    } or nil
-    local observeLook = Vector3.new(cCobro.LookVector.X, 0, cCobro.LookVector.Z)
-    if observeLook.Magnitude < 0.01 then
-        observeLook = Vector3.new(1, 0, 0)
-    else
-        observeLook = observeLook.Unit
-    end
-    local observePos = Vector3.new(cCobro.Position.X, math.max(cCobro.Position.Y, GetRoutineSafeY()), cCobro.Position.Z)
-    local burstObserveCF = CFrame.lookAt(observePos, observePos + observeLook)
-    local probableObservedAt = 0
-    local probableReason = nil
-    local promptEventSlack = 0.10
-
-    local function classifyBurstCarrySignal(instance)
-        if not instance then
-            return nil
-        end
-
-        if instance:IsA("Weld") and instance.Name == "HoldWeld" then
-            return "HOLD_WELD"
-        end
-
-        if instance:IsA("Weld") and instance.Name == "RightGrip" then
-            return "RIGHT_GRIP"
-        end
-
-        if instance:IsA("Model") and instance.Name == "RenderedBrainrot" then
-            return "RENDERED_BRAINROT"
-        end
-
-        if instance:IsA("Tool") then
-            return "TOOL:" .. instance.Name
-        end
-
-        if targetModel and (instance == targetModel or instance:IsDescendantOf(targetModel)) then
-            return "TARGET_ATTACH"
-        end
-
-        if targetRoot and instance == targetRoot then
-            return "TARGET_ROOT"
-        end
-
-        return nil
-    end
-
-    local function noteSignal(bucket, instance)
-        if not bucket or not instance then return end
-        local signal = classifyBurstCarrySignal(instance)
-        if not signal then return end
-        bucket[signal] = (bucket[signal] or 0) + 1
-    end
-
-    local function isRelevantCarryEvent(instance)
-        return classifyBurstCarrySignal(instance) ~= nil
-    end
-
-    local function hasSignal(bucket, signalName)
-        return (bucket and bucket[signalName] or 0) > 0
-    end
-
-    local function hasPromptHiddenAfterInteraction()
-        return promptHiddenAfterInteractionAt > 0
-    end
-
-    local function getInstancePath(instance)
-        if not instance then return "nil" end
-        local ok, fullName = pcall(function()
-            return instance:GetFullName()
-        end)
-        if ok and fullName and fullName ~= "" then
-            return fullName
-        end
-        local parentName = instance.Parent and instance.Parent.Name or "nil"
-        return string.format("%s:%s parent=%s", instance.ClassName, instance.Name, parentName)
-    end
-
-    local function restorePromptProps()
-        if not prompt or not prompt:IsDescendantOf(workspace) then return end
-        pcall(function()
-            prompt.RequiresLineOfSight = promptPropsBefore.RequiresLineOfSight
-            prompt.MaxActivationDistance = promptPropsBefore.MaxActivationDistance
-            prompt.HoldDuration = promptPropsBefore.HoldDuration
-        end)
-    end
-
-    local function applyBurstHumanoidLock(liveHum)
-        if not liveHum then return end
-        pcall(function()
-            liveHum.PlatformStand = true
-            liveHum.AutoRotate = true
-        end)
-    end
-
-    local function restoreBurstHumanoid(liveHum)
-        if not liveHum or not burstHumanoidPropsBefore then return end
-        pcall(function()
-            liveHum.PlatformStand = burstHumanoidPropsBefore.PlatformStand
-            liveHum.AutoRotate = burstHumanoidPropsBefore.AutoRotate
-        end)
-    end
-
-    local function canOwnWorldClaim()
-        return interactionObserved or triggeredObserved
-    end
-
-    local function noteClaim(reason)
-        if not burstSignals.claimSeen then
-            claimObservedAt = tick()
-        end
-
-        burstSignals.claimSeen = true
-        burstSignals.claimReason = burstSignals.claimReason or reason
-    end
-
-    local function noteProbable(reason)
-        if not reason then
-            return
-        end
-
-        if probableObservedAt <= 0 then
-            probableObservedAt = tick()
-            probableReason = reason
-            Logger:Log("[TELEMETRY] PICKUP_PROBABLE: " .. tostring(reason), Color3.new(1, 1, 0))
-        elseif not probableReason then
-            probableReason = reason
-        end
-    end
-
-    local function getProbablePickupSignal()
-        if burstSignals.claimSeen then
-            return true, burstSignals.claimReason or "WORLD_CLAIM_PROBABLE"
-        end
-
-        if hasSignal(burstSignals.descAdded, "HOLD_WELD") then
-            return true, "EVENT_HOLD_WELD"
-        end
-
-        if hasSignal(burstSignals.charAdded, "RENDERED_BRAINROT") or hasSignal(burstSignals.descAdded, "RENDERED_BRAINROT") then
-            return true, "EVENT_RENDERED_BRAINROT"
-        end
-
-        if hasSignal(burstSignals.charAdded, "TARGET_ATTACH") or hasSignal(burstSignals.descAdded, "TARGET_ATTACH") or hasSignal(burstSignals.descAdded, "TARGET_ROOT") then
-            return true, "EVENT_TARGET_ATTACH"
-        end
-
-        if hasSignal(burstSignals.descAdded, "RIGHT_GRIP") then
-            return true, "EVENT_RIGHT_GRIP"
-        end
-
-        if hasPromptHiddenAfterInteraction() and (triggeredObserved or interactionObserved) then
-            return true, "PROMPT_HIDDEN_AFTER_TRIGGER"
-        end
-
-        return false, nil
-    end
-
-    local function hasCarryEvidence()
-        return burstSignals.claimSeen
-            or hasSignal(burstSignals.descAdded, "HOLD_WELD")
-            or hasSignal(burstSignals.charAdded, "RENDERED_BRAINROT")
-            or hasSignal(burstSignals.descAdded, "RENDERED_BRAINROT")
-            or hasSignal(burstSignals.charAdded, "TARGET_ATTACH")
-            or hasSignal(burstSignals.descAdded, "TARGET_ATTACH")
-            or hasSignal(burstSignals.descAdded, "TARGET_ROOT")
-    end
-
-    local function hasCarrySwapEvidence()
-        local recentTriggerWindow = math.max(
-            Config.BurstCarryConfirmWindow or 0,
-            Config.BurstPostFireConfirmWindow or 0,
-            Config.BurstPostFireResolveWindow or 0,
-            0.25
-        )
-        local recentTriggerObserved = triggeredObservedAt > 0 and (tick() - triggeredObservedAt) <= (recentTriggerWindow + 0.15)
-
-        return hasCarryEvidence()
-            or recentTriggerObserved
-            or triggeredObserved
-            or hasPromptHiddenAfterInteraction()
-            or (probableObservedAt > 0 and probableReason ~= nil and probableReason ~= "PROMPT_HIDDEN_AFTER_TRIGGER")
-    end
-
-    local function isCarrySwapLikely(lossReason)
-        if not Config.BurstCarrySwapAutoResume then
-            return false
-        end
-
-        local lossText = tostring(lossReason or "")
-        local swapLoss = lossText == "HUM_DEAD"
-            or lossText == "CHAR_NIL"
-            or lossText == "HRP_NIL"
-            or lossText == "HUM_NIL"
-
-        if hasCarryEvidence() then
-            return triggeredObserved or hasPromptHiddenAfterInteraction() or interactionObserved or probableObservedAt > 0
-        end
-
-        if swapLoss and hasCarrySwapEvidence() then
-            return true
-        end
-
-        return false
-    end
-
-    local function markCarrySwapPending(stage, lossReason)
-        if not isCarrySwapLikely(lossReason) then
-            return false
-        end
-
-        FSM:MarkCarrySwapPending({
-            toolSnapshotBefore = toolSnapshotBefore,
-            characterChildrenBefore = characterChildrenBefore,
-            characterDescendantsBefore = characterDescendantsBefore,
-            targetRoot = targetRoot,
-            targetModel = targetModel,
-            prompt = prompt,
-            claimReason = burstSignals.claimReason or (triggeredObserved and "POST_TRIGGER_SWAP_SUSPECT" or nil),
-            lossReason = lossReason,
-        })
-        FSM:MarkTargetCooldown(targetRoot, prompt, Config.TargetRetryCooldown, "CARRY_SWAP_" .. string.upper(tostring(stage or "pending")))
-        Logger:Log("[CARRY_SWAP] Pending " .. tostring(stage) .. ": " .. tostring(lossReason) .. " | " .. tostring(burstSignals.claimReason or "sin_claim"), Color3.new(1, 1, 0))
-        return true
-    end
-
-    local function disconnectTempConnections()
-        for _, conn in ipairs(tempConnections) do
-            pcall(function() conn:Disconnect() end)
-        end
-        table.clear(tempConnections)
-    end
-
-    local function getEntityLossReason()
-        local liveChar = player.Character
-        if not liveChar then
-            return "CHAR_NIL"
-        end
-
-        local liveRoot = liveChar:FindFirstChild("HumanoidRootPart")
-        if not liveRoot then
-            return "HRP_NIL"
-        end
-
-        local liveHum = liveChar:FindFirstChildOfClass("Humanoid")
-        if not liveHum then
-            return "HUM_NIL"
-        end
-
-        if liveHum.Health <= 0 then
-            return "HUM_DEAD"
-        end
-
-        return string.format("UNSPECIFIED hp=%.1f anchored=%s y=%.2f", liveHum.Health, tostring(liveRoot.Anchored), liveRoot.Position.Y)
-    end
-
-    local function getCarryConfirmation()
-        local toolSnapshotNow = GetOwnedToolCounts()
-        local equippedDelta, equippedNames = GetPositiveToolDelta(toolSnapshotBefore.characterByName, toolSnapshotNow.characterByName)
-        if equippedDelta > 0 then
-            return true, "TOOL_EQUIPPED_OK: " .. tostring(equippedNames ~= "" and equippedNames or equippedDelta)
-        end
-
-        local totalDelta, totalNames = GetPositiveToolDelta(toolSnapshotBefore.totalByName, toolSnapshotNow.totalByName)
-        if totalDelta > 0 then
-            return true, "TOOL_DELTA_OK: " .. tostring(totalNames ~= "" and totalNames or totalDelta)
-        end
-
-        return false, nil
-    end
-
-    local function getDirectCarryStateConfirmation()
-        local liveChar = player.Character
-        if not liveChar then return false, nil end
-
-        local targetAttachedToChar = (targetRoot and targetRoot:IsDescendantOf(liveChar))
-            or (targetModel and targetModel:IsDescendantOf(liveChar))
-            or (prompt and prompt:IsDescendantOf(liveChar))
-        local carryLinkedToCurrentTarget = burstSignals.claimSeen or targetAttachedToChar
-
-        local liveRoot = liveChar:FindFirstChild("HumanoidRootPart")
-        if liveRoot then
-            local holdWeld = liveRoot:FindFirstChild("HoldWeld")
-            if holdWeld and holdWeld:IsA("Weld") and carryLinkedToCurrentTarget then
-                return true, "HOLD_WELD_OK"
-            end
-        end
-
-        -- RenderedBrainrot en personaje: señal directa de carry para este juego.
-        -- Solo necesita triggeredObserved (no carryLinkedToCurrentTarget) porque el
-        -- servidor reparentea el modelo aquí mismo después del trigger.
-        local rendered = liveChar:FindFirstChild("RenderedBrainrot") or liveChar:FindFirstChild("RenderedBrainrot", true)
-        if rendered and rendered:IsA("Model") then
-            if carryLinkedToCurrentTarget or triggeredObserved then
-                return true, "CHAR_RENDERED_OK"
-            end
-        end
-
-        local rightGrip = liveChar:FindFirstChild("RightGrip", true)
-        local equippedTool = liveChar:FindFirstChildOfClass("Tool")
-        if rightGrip and rightGrip:IsA("Weld") and equippedTool and carryLinkedToCurrentTarget then
-            return true, "RIGHT_GRIP_OK: " .. tostring(equippedTool.Name)
-        end
-
-        if targetRoot and targetRoot:IsDescendantOf(liveChar) then
-            return true, "TARGET_ON_CHAR_OK"
-        end
-
-        if targetModel and targetModel.Parent == liveChar then
-            return true, "TARGET_MODEL_PARENT_CHAR_OK"
-        end
-
-        if targetModel and targetModel:IsDescendantOf(liveChar) then
-            return true, "TARGET_MODEL_ON_CHAR_OK"
-        end
-
-        if prompt and prompt:IsDescendantOf(liveChar) then
-            if prompt.Enabled == false then
-                return true, "PROMPT_ON_CHAR_DISABLED_OK"
-            end
-            return true, "PROMPT_ON_CHAR_OK"
-        end
-
-        return false, nil
-    end
-
-    local function getTransientCarryConfirmation()
-        if hasSignal(burstSignals.descAdded, "HOLD_WELD") then
-            return true, "HOLD_WELD_EVENT_OK"
-        end
-
-        if hasSignal(burstSignals.descAdded, "HOLD_WELD") and (
-            hasSignal(burstSignals.charAdded, "RENDERED_BRAINROT")
-            or hasSignal(burstSignals.descAdded, "RENDERED_BRAINROT")
-            or hasSignal(burstSignals.charAdded, "TARGET_ATTACH")
-            or hasSignal(burstSignals.descAdded, "TARGET_ATTACH")
-        ) then
-            return true, "HOLD_WELD_ATTACH_EVENT_OK"
-        end
-
-        if hasSignal(burstSignals.charAdded, "RENDERED_BRAINROT") or hasSignal(burstSignals.descAdded, "RENDERED_BRAINROT") then
-            return true, "RENDERED_EVENT_OK"
-        end
-
-        if hasSignal(burstSignals.charAdded, "TARGET_ATTACH") or hasSignal(burstSignals.descAdded, "TARGET_ATTACH") or hasSignal(burstSignals.descAdded, "TARGET_ROOT") then
-            return true, "TARGET_ATTACH_EVENT_OK"
-        end
-
-        if hasSignal(burstSignals.descAdded, "RIGHT_GRIP") then
-            local toolEventText = FormatSignalCounts(burstSignals.toolAdded, 4)
-            if toolEventText ~= "" then
-                return true, "RIGHT_GRIP_TOOL_EVENT_OK: " .. toolEventText
-            end
-        end
-
-        if hasPromptHiddenAfterInteraction() and burstSignals.claimSeen then
-            if hasSignal(burstSignals.descRemoved, "HOLD_WELD") or hasSignal(burstSignals.descRemoved, "RENDERED_BRAINROT") then
-                return true, "PROMPT_HIDDEN_ATTACH_OK"
-            end
-        end
-
-        return false, nil
-    end
-
-    local function getCharacterAttachConfirmation()
-        local liveChar = player.Character
-        local directOk, directReason = getDirectCarryStateConfirmation()
-        if directOk then
-            return true, directReason
-        end
-
-        local hasDescDelta, descDeltaNames = GetSignatureDelta(characterDescendantsBefore, GetRelevantDescendantSignatureCounts(liveChar))
-        if hasDescDelta then
-            return true, "CHAR_DESC_OK: " .. tostring(descDeltaNames)
-        end
-
-        local hasDelta, deltaNames = GetSignatureDelta(characterChildrenBefore, GetChildSignatureCounts(liveChar))
-        if hasDelta then
-            return true, "CHAR_ATTACH_OK: " .. tostring(deltaNames)
-        end
-        return false, nil
-    end
-
-    local function getWorldClaimConfirmation()
-        if not canOwnWorldClaim() then
-            return false, nil
-        end
-
-        local activeFolder = workspace:FindFirstChild("ActiveBrainrots") or activeBrainrots
-        if targetRoot and activeFolder and not targetRoot:IsDescendantOf(activeFolder) then
-            noteClaim("CLAIM_WORLD_OK: target salio de ActiveBrainrots")
-            return true, "CLAIM_WORLD_OK: target salio de ActiveBrainrots"
-        end
-        if targetRoot and not targetRoot:IsDescendantOf(workspace) then
-            noteClaim("TARGET_REMOVED_OK: target removido de workspace")
-            return true, "TARGET_REMOVED_OK: target removido de workspace"
-        end
-        if prompt then
-            if not prompt:IsDescendantOf(workspace) then
-                noteClaim("PROMPT_MISSING_OK: prompt removido de workspace")
-                return true, "PROMPT_MISSING_OK: prompt removido de workspace"
-            end
-            if targetContainer and not prompt:IsDescendantOf(targetContainer) then
-                noteClaim("PROMPT_REPARENT_OK: prompt movido fuera del target")
-                return true, "PROMPT_REPARENT_OK: prompt movido fuera del target"
-            end
-            if activeFolder and not prompt:IsDescendantOf(activeFolder) then
-                noteClaim("PROMPT_FOLDER_EXIT_OK: prompt salio de ActiveBrainrots")
-                return true, "PROMPT_FOLDER_EXIT_OK: prompt salio de ActiveBrainrots"
-            end
-        end
-        return false, nil
-    end
-
-    local function hasStableWorldClaimState()
-        local activeFolder = workspace:FindFirstChild("ActiveBrainrots") or activeBrainrots
-        local targetGone = false
-        local promptGone = false
-
-        if targetRoot then
-            targetGone = (activeFolder and not targetRoot:IsDescendantOf(activeFolder))
-                or not targetRoot:IsDescendantOf(workspace)
-        end
-
-        if prompt then
-            promptGone = not prompt:IsDescendantOf(workspace)
-                or (targetContainer and not prompt:IsDescendantOf(targetContainer))
-                or (activeFolder and not prompt:IsDescendantOf(activeFolder))
-        else
-            promptGone = true
-        end
-
-        return targetGone or promptGone, targetGone, promptGone
-    end
-
-    local function finishBurst(ok, reason)
-        local _, finishRoot, finishHum = FSM:GetValidEntity()
-        if finishRoot then
-            Motor:DestroyBurstHoverRig(finishRoot)
-        end
-        restoreBurstHumanoid(finishHum)
-        if finishRoot then
-            Motor:SealCharacter(finishRoot)
-        end
-        restorePromptProps()
-        disconnectTempConnections()
-        return ok, reason
-    end
-
-    local function applyBurstPoseMode(liveChar, liveRoot, mode)
-        if not liveChar or not liveRoot then
-            return
-        end
-
-        local liveHum = liveChar:FindFirstChildOfClass("Humanoid")
-        local targetCF = mode == "INTERACT" and cCobro or burstObserveCF
-        local isHoverObserve = mode == "OBSERVE" and Config.BurstHoverHoldEnabled
-
-        if mode ~= lastBurstPoseMode and lastBurstPoseMode == "OBSERVE" then
-            Motor:DestroyBurstHoverRig(liveRoot)
-        end
-
-        if mode == "RELEASE" then
-            applyBurstHumanoidLock(liveHum)
-            Motor:DestroyBurstHoverRig(liveRoot)
-            if liveRoot.Anchored then
-                Motor:ReleaseCharacter(liveRoot)
-            end
-        elseif isHoverObserve then
-            restoreBurstHumanoid(liveHum)
-            if liveHum then
-                pcall(function()
-                    liveHum.PlatformStand = false
-                    liveHum.AutoRotate = true
-                end)
-            end
-            if liveRoot.Anchored then
-                Motor:ReleaseCharacter(liveRoot)
-            end
-            local _, align = Motor:EnsureBurstHoverRig(liveRoot)
-            if align then
-                align.Position = targetCF.Position
-            end
-            if not hoverHoldLogged then
-                hoverHoldLogged = true
-                Logger:Log("[TELEMETRY] BURST_HOVER_HOLD", Color3.new(0, 1, 1))
-            end
-        else
-            Motor:DestroyBurstHoverRig(liveRoot)
-            restoreBurstHumanoid(liveHum)
-            Motor:SealCharacter(liveRoot)
-        end
-
-        liveRoot.CanCollide = false
-        liveRoot.CanTouch = mode == "OBSERVE" or mode == "RELEASE"
-        if mode == "INTERACT" or mode == "RELEASE" then
-            pcall(function()
-                liveChar:PivotTo(targetCF)
-            end)
-        elseif (liveRoot.Position - targetCF.Position).Magnitude > math.max(Config.BurstReSnapDistance or 0, 0.25) then
-            pcall(function()
-                liveChar:PivotTo(targetCF)
-            end)
-        end
-        Motor:StopMotion(liveRoot)
-        lastBurstPoseMode = mode
-    end
-
-    local function runPostTriggerMicroRelease(reason)
-        if postTriggerMicroReleaseDone or not Config.BurstPostTriggerRelease then
-            return true, nil
-        end
-
-        local releaseDuration = math.max(Config.BurstPostTriggerGrace or 0, 0)
-        postTriggerMicroReleaseDone = true
-
-        if releaseDuration <= 0 then
-            return true, nil
-        end
-
-        Logger:Log("[TELEMETRY] BURST_MICRO_RELEASE: " .. tostring(reason), Color3.new(0, 1, 1))
-
-        local deadline = tick() + releaseDuration
-        while tick() < deadline do
-            if not Config.Activo then
-                return false, "BURST_ABORT_MANUAL"
-            end
-            if FSM.StateID ~= burstToken then
-                return false, "STATE_OVERRIDDEN"
-            end
-
-            local liveChar, liveRoot, liveHum = FSM:GetValidEntity()
-            if not liveChar or not liveRoot or not liveHum then
-                return false, getEntityLossReason()
-            end
-
-            applyBurstPoseMode(liveChar, liveRoot, "RELEASE")
-            RS.Heartbeat:Wait()
-        end
-
-        local endChar, endRoot, endHum = FSM:GetValidEntity()
-        if not endChar or not endRoot or not endHum then
-            return false, getEntityLossReason()
-        end
-
-        applyBurstPoseMode(endChar, endRoot, "OBSERVE")
-        Logger:Log("[TELEMETRY] BURST_MICRO_RESEAL", Color3.new(1, 1, 0))
-        return true, nil
-    end
-
-    local function maintainBurstPose(liveChar, liveRoot, allowFree)
-        if not liveChar or not liveRoot then return end
-        applyBurstPoseMode(liveChar, liveRoot, allowFree and "OBSERVE" or "INTERACT")
-    end
-
-    local function sustainBurstPose(seconds, allowFree)
-        local duration = math.max(seconds or 0, 0)
-        if duration <= 0 then
-            return true, nil
-        end
-
-        local deadline = tick() + duration
-        while tick() < deadline do
-            if not Config.Activo then
-                return false, "BURST_ABORT_MANUAL"
-            end
-            if FSM.StateID ~= burstToken then
-                return false, "STATE_OVERRIDDEN"
-            end
-
-            local liveChar, liveRoot, liveHum = FSM:GetValidEntity()
-            if not liveChar or not liveRoot or not liveHum then
-                return false, getEntityLossReason()
-            end
-
-            maintainBurstPose(liveChar, liveRoot, allowFree)
-            RS.Heartbeat:Wait()
-        end
-
-        return true, nil
-    end
-
-    local waitForClaimSettle
-
-    local function waitForPostFireResolution(reason)
-        local baseWindow = math.max(Config.BurstPostFireResolveWindow or 0, 0)
-        local deadline = tick() + baseWindow
-        local extendedDeadline = deadline
-        if deadline <= tick() then
-            return false, nil
-        end
-
-        Logger:Log("[TELEMETRY] POST_FIRE_RESOLVE: " .. tostring(reason), Color3.new(0, 1, 1))
-
-        while tick() < extendedDeadline do
-            if not Config.Activo then return false, "BURST_ABORT_MANUAL" end
-            if FSM.StateID ~= burstToken then return false, "STATE_OVERRIDDEN" end
-
-            local liveChar, liveRoot, liveHum = FSM:GetValidEntity()
-            if not liveChar or not liveRoot or not liveHum then
-                local lossReason = getEntityLossReason()
-                Logger:Log("[TELEMETRY] ENTITY_LOST_POST_FIRE_WAIT: " .. tostring(lossReason), Color3.new(1, 0, 0))
-                if markCarrySwapPending("post_fire_wait", lossReason) then
-                    return false, "CARRY_SWAP_PENDING"
-                end
-                return false, "NO_ENTITY"
-            end
-
-            applyBurstPoseMode(liveChar, liveRoot, "OBSERVE")
-
-            local carryConfirmed, carryReason = getCarryConfirmation()
-            if carryConfirmed then
-                Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(carryReason), Color3.new(0, 1, 0))
-                return true, carryReason
-            end
-
-            local attachConfirmed, attachReason = getCharacterAttachConfirmation()
-            if attachConfirmed then
-                Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(attachReason), Color3.new(0, 1, 0))
-                return true, attachReason
-            end
-
-            local claimed, claimedReason = getWorldClaimConfirmation()
-            if claimed then
-                Logger:Log("[TELEMETRY] POST_FIRE_RESOLVE: " .. tostring(claimedReason), Color3.new(0, 1, 1))
-                return waitForClaimSettle(claimedReason)
-            end
-
-            local probableOk, observedReason = getProbablePickupSignal()
-            if probableOk then
-                local isNewProbable = probableObservedAt <= 0
-                noteProbable(observedReason)
-                if isNewProbable then
-                    extendedDeadline = math.max(extendedDeadline, tick() + math.max(Config.BurstCarryConfirmWindow or 0, baseWindow))
-                end
-            end
-
-            RS.Heartbeat:Wait()
-        end
-
-        local endChar, endRoot, endHum = FSM:GetValidEntity()
-        if endChar and endRoot and endHum then
-            applyBurstPoseMode(endChar, endRoot, "OBSERVE")
-        end
-
-        return false, nil
-    end
-
-    waitForClaimSettle = function(claimReason)
-        Logger:Log("[TELEMETRY] CLAIM_SEEN_SETTLING: " .. tostring(claimReason), Color3.new(0, 1, 1))
-        local releaseOk, releaseReason = runPostTriggerMicroRelease(claimReason)
-        if not releaseOk then
-            Logger:Log("[TELEMETRY] ENTITY_LOST_CLAIM_RELEASE: " .. tostring(releaseReason), Color3.new(1, 0, 0))
-            if markCarrySwapPending("claim_release", releaseReason) then
-                return false, "CARRY_SWAP_PENDING"
-            end
-            if releaseReason == "BURST_ABORT_MANUAL" or releaseReason == "STATE_OVERRIDDEN" then
-                return false, releaseReason
-            end
-            return false, "NO_ENTITY"
-        end
-
-        local deadline = tick() + Config.BurstClaimSettleWindow
-
-        while tick() < deadline do
-            if not Config.Activo then return false, "BURST_ABORT_MANUAL" end
-            if FSM.StateID ~= burstToken then return false, "STATE_OVERRIDDEN" end
-
-            local charS, hrpS, humS = FSM:GetValidEntity()
-            if not hrpS or not charS or not humS then
-                local lossReason = getEntityLossReason()
-                Logger:Log("[TELEMETRY] ENTITY_LOST_SETTLE: " .. lossReason, Color3.new(1, 0, 0))
-                if markCarrySwapPending("settle", lossReason) then
-                    return false, "CARRY_SWAP_PENDING"
-                end
-                return false, "NO_ENTITY"
-            end
-
-            local lastHP = humS:GetAttribute("LastHP") or humS.Health
-            if humS.Health < lastHP then return false, "HP_DROPPED_IN_BURST" end
-
-            maintainBurstPose(charS, hrpS, true)
-
-            local carryConfirmed, carryReason = getCarryConfirmation()
-            if carryConfirmed then
-                Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(carryReason), Color3.new(0, 1, 0))
-                return true, carryReason
-            end
-
-            local attachConfirmed, attachReason = getCharacterAttachConfirmation()
-            if attachConfirmed then
-                Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(attachReason), Color3.new(0, 1, 0))
-                return true, attachReason
-            end
-
-            local claimedStillThere, _ = getWorldClaimConfirmation()
-            if not claimedStillThere then
-                Logger:Log("[TELEMETRY] CLAIM_SETTLE_LOST", Color3.new(1, 0.5, 0))
-                return false, "CLAIM_SETTLE_LOST"
-            end
-
-            local probableOk, observedReason = getProbablePickupSignal()
-            if probableOk then
-                noteProbable(observedReason)
-            end
-
-            local stableWorldClaim, targetGone, promptGone = hasStableWorldClaimState()
-            if stableWorldClaim and claimObservedAt > 0 and (tick() - claimObservedAt) >= (Config.BurstCarryConfirmWindow or 0) then
-                local worldReason = string.format(
-                    "CLAIM_WORLD_STABLE_OK: %s targetGone=%s promptGone=%s",
-                    tostring(burstSignals.claimReason or claimReason),
-                    tostring(targetGone),
-                    tostring(promptGone)
-                )
-                Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. worldReason, Color3.new(0, 1, 0))
-                return true, worldReason
-            end
-
-            RS.Heartbeat:Wait()
-        end
-
-        Logger:Log("[TELEMETRY] CLAIM_SETTLE_NO_ATTACH", Color3.new(1, 0.5, 0))
-        return false, "CLAIM_WITHOUT_CARRY_CONFIRM"
-    end
-
-    if prompt then
-        table.insert(tempConnections, prompt.AncestryChanged:Connect(function()
-            local activeFolder = workspace:FindFirstChild("ActiveBrainrots") or activeBrainrots
-            if not prompt:IsDescendantOf(workspace) then
-                if canOwnWorldClaim() then
-                    noteClaim("PROMPT_ANCESTRY_MISSING_OK")
-                end
-                Logger:Log("[TELEMETRY] PROMPT_ANCESTRY_MISSING: " .. getInstancePath(prompt), Color3.new(0, 1, 1))
-            elseif targetContainer and not prompt:IsDescendantOf(targetContainer) then
-                if canOwnWorldClaim() then
-                    noteClaim("PROMPT_ANCESTRY_REPARENT_OK")
-                end
-                Logger:Log("[TELEMETRY] PROMPT_ANCESTRY_REPARENT: " .. getInstancePath(prompt), Color3.new(0, 1, 1))
-            elseif activeFolder and not prompt:IsDescendantOf(activeFolder) then
-                if canOwnWorldClaim() then
-                    noteClaim("PROMPT_ANCESTRY_FOLDER_EXIT_OK")
-                end
-                Logger:Log("[TELEMETRY] PROMPT_ANCESTRY_FOLDER_EXIT: " .. getInstancePath(prompt), Color3.new(0, 1, 1))
-            end
-        end))
-        table.insert(tempConnections, prompt.PromptHidden:Connect(function()
-            promptHiddenObserved = true
-            promptHiddenObservedAt = tick()
-            if lastInteractionAt > 0 and promptHiddenObservedAt + promptEventSlack >= lastInteractionAt then
-                promptHiddenAfterInteractionAt = promptHiddenObservedAt
-            end
-            Logger:Log("[TELEMETRY] PROMPT_HIDDEN", Color3.new(1, 1, 0))
-        end))
-        table.insert(tempConnections, prompt.PromptButtonHoldBegan:Connect(function(playerWhoTriggered)
-            if playerWhoTriggered == player then
-                Logger:Log("[TELEMETRY] PROMPT_HOLD_BEGAN", Color3.new(1, 1, 0))
-            end
-        end))
-        table.insert(tempConnections, prompt.PromptButtonHoldEnded:Connect(function(playerWhoTriggered)
-            if playerWhoTriggered == player then
-                Logger:Log("[TELEMETRY] PROMPT_HOLD_ENDED", Color3.new(1, 0.7, 0))
-            end
-        end))
-        table.insert(tempConnections, prompt.Triggered:Connect(function(playerWhoTriggered)
-            if playerWhoTriggered == player then
-                triggeredObserved = true
-                triggeredObservedAt = tick()
-                if promptHiddenObservedAt > 0 and lastInteractionAt > 0 and promptHiddenObservedAt + promptEventSlack >= lastInteractionAt then
-                    promptHiddenAfterInteractionAt = math.max(promptHiddenAfterInteractionAt, promptHiddenObservedAt)
-                end
-                Logger:Log("[TELEMETRY] PROMPT_TRIGGERED", Color3.new(0, 1, 0))
-            end
-        end))
-        table.insert(tempConnections, prompt.TriggerEnded:Connect(function(playerWhoTriggered)
-            if playerWhoTriggered == player then
-                Logger:Log("[TELEMETRY] PROMPT_TRIGGER_ENDED", Color3.new(0.7, 1, 0.2))
-            end
-        end))
-    end
-
-    if char then
-        if targetRoot then
-            table.insert(tempConnections, targetRoot.AncestryChanged:Connect(function()
-                local activeFolder = workspace:FindFirstChild("ActiveBrainrots") or activeBrainrots
-                if not targetRoot:IsDescendantOf(workspace) then
-                    if canOwnWorldClaim() then
-                        noteClaim("TARGET_ANCESTRY_REMOVED_OK")
-                    end
-                    Logger:Log("[TELEMETRY] TARGET_ANCESTRY_REMOVED: " .. getInstancePath(targetRoot), Color3.new(0, 1, 1))
-                elseif activeFolder and not targetRoot:IsDescendantOf(activeFolder) then
-                    if canOwnWorldClaim() then
-                        noteClaim("TARGET_ANCESTRY_FOLDER_EXIT_OK")
-                    end
-                    Logger:Log("[TELEMETRY] TARGET_ANCESTRY_FOLDER_EXIT: " .. getInstancePath(targetRoot), Color3.new(0, 1, 1))
-                end
-            end))
-        end
-        table.insert(tempConnections, char.ChildAdded:Connect(function(child)
-            if isRelevantCarryEvent(child) then
-                noteSignal(burstSignals.charAdded, child)
-            end
-        end))
-        table.insert(tempConnections, char.ChildRemoved:Connect(function(child)
-            if isRelevantCarryEvent(child) then
-                noteSignal(burstSignals.charRemoved, child)
-            end
-        end))
-        table.insert(tempConnections, char.DescendantAdded:Connect(function(descendant)
-            if isRelevantCarryEvent(descendant) then
-                noteSignal(burstSignals.descAdded, descendant)
-            end
-        end))
-        table.insert(tempConnections, char.DescendantRemoving:Connect(function(descendant)
-            if isRelevantCarryEvent(descendant) then
-                noteSignal(burstSignals.descRemoved, descendant)
-            end
-        end))
-    end
-
-    local backpack = player:FindFirstChildOfClass("Backpack")
-    if backpack then
-        table.insert(tempConnections, backpack.ChildAdded:Connect(function(child)
-            if child:IsA("Tool") then
-                noteSignal(burstSignals.toolAdded, child)
-            end
-        end))
-        table.insert(tempConnections, backpack.ChildRemoved:Connect(function(child)
-            if child:IsA("Tool") then
-                noteSignal(burstSignals.toolRemoved, child)
-            end
-        end))
-    end
-
-    Motor:SealCharacter(hrp)
-    Motor:TeleportCharacter(char, hrp, cCobro, true)
-    Logger:Log("[TELEMETRY] PRE_BURST", Color3.new(1, 1, 0))
-    
-    Motor:SealCharacter(hrp)
-    Motor:TeleportCharacter(char, hrp, cCobro, true)
-    Logger:Log("[TELEMETRY] POST_PROBE", Color3.new(1, 1, 0))
-    if Config.BurstProbeFree then
-        Motor:ReleaseCharacter(hrp)
-        RS.Heartbeat:Wait()
-        Motor:SealCharacter(hrp)
-        Motor:TeleportCharacter(char, hrp, cCobro, true)
-        Logger:Log("[TELEMETRY] PROBE_FREE", Color3.new(1, 1, 0))
-    end
-    
-    -- [EXPLICACIÓN DEL FALLO LÓGICO DE BURST ANTERIOR]
-    -- El burst disparaba sin comprobar si estábamos dentro de MaxActivationDistance 3D.
-    -- Con esta telemetría pura sabrás exactamente por qué falla.
-    local spoofedHoldDuration = promptPropsBefore.HoldDuration
-    pcall(function()
-        prompt.RequiresLineOfSight = false
-        if (Config.BurstPromptMaxDistance or 0) > 0 then
-            prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, Config.BurstPromptMaxDistance)
-        end
-        if Config.BurstSpoofHoldDuration and prompt.HoldDuration > Config.BurstSpoofHoldValue then
-            prompt.HoldDuration = Config.BurstSpoofHoldValue
-            spoofedHoldDuration = prompt.HoldDuration
-        end
-    end)
-
-    local maxDist = prompt and prompt.MaxActivationDistance or 0
-    local hDur = prompt and prompt.HoldDuration or 0
-    local pPos = GetPromptWorldPosition(prompt, targetRoot.Position)
-    local burstY = cCobro.Position.Y
-    local d3D = (hrp.Position - pPos).Magnitude
-    local dXZ = math.sqrt((hrp.Position.X - pPos.X)^2 + (hrp.Position.Z - pPos.Z)^2)
-
-    Logger:Log(string.format("[BURST_INFO] 3D:%.1f|XZ:%.1f|Y:%.1f|PromptY:%.1f|BurstY:%.1f", d3D, dXZ, hrp.Position.Y, pPos.Y, burstY), Color3.new(0, 1, 1))
-    Logger:Log(string.format("[BURST_INFO] Hold:%.1fs|MaxD:%.1f|Anc:%s", hDur, maxDist, tostring(hrp.Anchored)), Color3.new(0, 1, 1))
-    if Config.BurstSpoofHoldDuration and (promptPropsBefore.HoldDuration or 0) > hDur then
-        Logger:Log(string.format("[BURST_INFO] HoldSpoof:%.2f->%.2f", promptPropsBefore.HoldDuration or 0, hDur), Color3.new(0, 1, 1))
-    end
-    Logger:Log("[BURST_MODE] SEALED_MICRO_RELEASE_CONFIRM", Color3.new(0, 1, 1))
-
-    do
-        local sustainOk, sustainReason = sustainBurstPose(Config.BurstPromptSetupDelay, false)
-        if not sustainOk then
-            if sustainReason == "BURST_ABORT_MANUAL" or sustainReason == "STATE_OVERRIDDEN" then
-                return finishBurst(false, sustainReason)
-            end
-            Logger:Log("[TELEMETRY] ENTITY_LOST_SETUP: " .. tostring(sustainReason), Color3.new(1, 0, 0))
-            return finishBurst(false, "NO_ENTITY")
-        end
-    end
-
-    local function checkPositiveConfirmation(logPrefix)
-        local carryConfirmed, carryReason = getCarryConfirmation()
-        if carryConfirmed then
-            Logger:Log("[TELEMETRY] " .. tostring(carryReason), Color3.new(0, 1, 0))
-            return true, carryReason
-        end
-
-        local attachConfirmed, attachReason = getCharacterAttachConfirmation()
-        if attachConfirmed then
-            Logger:Log("[TELEMETRY] " .. tostring(attachReason), Color3.new(0, 1, 0))
-            return true, attachReason
-        end
-
-        local claimed, claimedReason = getWorldClaimConfirmation()
-        if claimed then
-            Logger:Log("[TELEMETRY] " .. tostring(logPrefix) .. ": " .. tostring(claimedReason), Color3.new(0, 1, 1))
-            return waitForClaimSettle(claimedReason)
-        end
-
-        local probableOk, observedReason = getProbablePickupSignal()
-        if probableOk then
-            noteProbable(observedReason)
-        end
-
-        return false, nil
-    end
-
-    local function performPromptInteraction(liveChar, liveRoot, livePrompt)
-        if not livePrompt then return false, "NO_PROMPT" end
-
-        if fireproximityprompt then
-            local ok, err = pcall(function()
-                fireproximityprompt(livePrompt)
-            end)
-            if ok then
-                return true, "FIRE_PROMPT"
-            end
-
-            if (livePrompt.HoldDuration or 0) <= 0 and not Config.BurstFallbackFireInHold then
-                return false, err
-            end
-        end
-
-        local holdDuration = livePrompt.HoldDuration or 0
-        if holdDuration > 0 then
-            local ok, err = pcall(function()
-                livePrompt:InputHoldBegin()
-                task.wait(holdDuration + Config.BurstHoldExtra)
-                livePrompt:InputHoldEnd()
-            end)
-            return ok, ok and "INPUT_HOLD" or err
-        end
-
-        return false, "NO_INTERACT_IMPL"
-    end
-
-    local totalAttempts = ((prompt.HoldDuration or 0) > 0) and Config.BurstHoldAttempts or Config.BurstRapidAttempts
-
-    for attempt = 1, totalAttempts do
-        if not Config.Activo then return finishBurst(false, "BURST_ABORT_MANUAL") end
-        if FSM.StateID ~= burstToken then return finishBurst(false, "STATE_OVERRIDDEN") end
-
-        local charB, hrpB, humB = FSM:GetValidEntity()
-        if not hrpB or not charB or not humB then
-            local lossReason = getEntityLossReason()
-            Logger:Log("[TELEMETRY] ENTITY_LOST_PRE_FIRE: " .. lossReason, Color3.new(1, 0, 0))
-            if markCarrySwapPending("pre_fire", lossReason) then
-                return finishBurst(false, "CARRY_SWAP_PENDING")
-            end
-            return finishBurst(false, "NO_ENTITY")
-        end
-
-        local lastHP = humB:GetAttribute("LastHP") or humB.Health
-        if humB.Health < lastHP then return finishBurst(false, "HP_DROPPED_IN_BURST") end
-
-        maintainBurstPose(charB, hrpB, false)
-
-        local earlyOk, earlyReason = checkPositiveConfirmation("CLAIM_PRE_FIRE")
-        if earlyOk then
-            Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(earlyReason), Color3.new(0, 1, 0))
-            return finishBurst(true, earlyReason)
-        elseif earlyReason == "CLAIM_WITHOUT_CARRY_CONFIRM" or earlyReason == "CLAIM_SETTLE_LOST" then
-            return finishBurst(false, earlyReason)
-        end
-
-        if not targetRoot or not targetRoot:IsDescendantOf(workspace) then
-            Logger:Log("[TELEMETRY] TARGET_VANISHED_PRE_CONFIRM", Color3.new(1, 0.5, 0))
-            return finishBurst(false, "TARGET_VANISHED_PRE_CONFIRM")
-        end
-
-        if not prompt or not prompt:IsDescendantOf(workspace) or not prompt.Enabled then
-            Logger:Log("[TELEMETRY] NO_PROMPT_PRE_FIRE", Color3.new(1, 0.5, 0))
-            return finishBurst(false, "NO_PROMPT")
-        end
-
-        maintainBurstPose(charB, hrpB, false)
-
-        interactionObserved = true
-        lastInteractionAt = tick()
-        local fireOk, fireErr = performPromptInteraction(charB, hrpB, prompt)
-
-        if fireOk then
-            Logger:Log("[TELEMETRY] GRAB_FIRE attempt=" .. tostring(attempt) .. " mode=" .. tostring(fireErr), Color3.new(1, 1, 0))
-
-            local resolveOk, resolveReason = waitForPostFireResolution("POST_FIRE:" .. tostring(fireErr))
-            if resolveOk then
-                Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(resolveReason), Color3.new(0, 1, 0))
-                return finishBurst(true, resolveReason)
-            elseif resolveReason == "CARRY_SWAP_PENDING" then
-                return finishBurst(false, resolveReason)
-            elseif resolveReason == "CLAIM_WITHOUT_CARRY_CONFIRM" or resolveReason == "CLAIM_SETTLE_LOST" then
-                return finishBurst(false, resolveReason)
-            elseif resolveReason == "BURST_ABORT_MANUAL" or resolveReason == "STATE_OVERRIDDEN" then
-                return finishBurst(false, resolveReason)
-            elseif resolveReason == "NO_ENTITY" then
-                return finishBurst(false, resolveReason)
-            end
-        elseif attempt == 1 or fireErr then
-            Logger:Log("[TELEMETRY] GRAB_FIRE_FAIL attempt=" .. tostring(attempt) .. " err=" .. tostring(fireErr), Color3.new(1, 0.5, 0))
-        end
-
-        local postOk, postReason = checkPositiveConfirmation("CLAIM_POST_FIRE")
-        if postOk then
-            Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(postReason), Color3.new(0, 1, 0))
-            return finishBurst(true, postReason)
-        elseif postReason == "CARRY_SWAP_PENDING" then
-            return finishBurst(false, postReason)
-        elseif postReason == "CLAIM_WITHOUT_CARRY_CONFIRM" or postReason == "CLAIM_SETTLE_LOST" then
-            return finishBurst(false, postReason)
-        end
-
-        if burstSignals.claimSeen then
-            Logger:Log("[TELEMETRY] CLAIM_SEEN_WAIT_SETTLE", Color3.new(1, 1, 0))
-            break
-        end
-
-        if hasPromptHiddenAfterInteraction() or probableObservedAt > 0 then
-            Logger:Log("[TELEMETRY] POST_TRIGGER_OBSERVE_ONLY attempt=" .. tostring(attempt), Color3.new(1, 1, 0))
-            break
-        end
-
-        do
-            local sustainOk, sustainReason = sustainBurstPose(Config.BurstRapidAttemptDelay, false)
-            if not sustainOk then
-                if sustainReason == "BURST_ABORT_MANUAL" or sustainReason == "STATE_OVERRIDDEN" then
-                    return finishBurst(false, sustainReason)
-                end
-                Logger:Log("[TELEMETRY] ENTITY_LOST_INTER_ATTEMPT: " .. tostring(sustainReason), Color3.new(1, 0, 0))
-                if markCarrySwapPending("inter_attempt", sustainReason) then
-                    return finishBurst(false, "CARRY_SWAP_PENDING")
-                end
-                return finishBurst(false, "NO_ENTITY")
-            end
-        end
-    end
-
-    local confirmDeadline = tick() + Config.BurstPostFireConfirmWindow
-    while tick() < confirmDeadline do
-        if not Config.Activo then return finishBurst(false, "BURST_ABORT_MANUAL") end
-        if FSM.StateID ~= burstToken then return finishBurst(false, "STATE_OVERRIDDEN") end
-
-        local charB, hrpB, humB = FSM:GetValidEntity()
-        if not hrpB or not charB or not humB then
-            local lossReason = getEntityLossReason()
-            Logger:Log("[TELEMETRY] ENTITY_LOST_CONFIRM: " .. lossReason, Color3.new(1, 0, 0))
-            if markCarrySwapPending("confirm", lossReason) then
-                return finishBurst(false, "CARRY_SWAP_PENDING")
-            end
-            return finishBurst(false, "NO_ENTITY")
-        end
-
-        local lastHP = humB:GetAttribute("LastHP") or humB.Health
-        if humB.Health < lastHP then return finishBurst(false, "HP_DROPPED_IN_BURST") end
-
-        maintainBurstPose(charB, hrpB, triggeredObserved or hasPromptHiddenAfterInteraction() or probableObservedAt > 0 or burstSignals.claimSeen)
-
-        local confirmOk, confirmReason = checkPositiveConfirmation("CONFIRM_WINDOW")
-        if confirmOk then
-            Logger:Log("[TELEMETRY] PICKUP_CONFIRMED: " .. tostring(confirmReason), Color3.new(0, 1, 0))
-            return finishBurst(true, confirmReason)
-        elseif confirmReason == "CARRY_SWAP_PENDING" then
-            return finishBurst(false, confirmReason)
-        elseif confirmReason == "CLAIM_WITHOUT_CARRY_CONFIRM" or confirmReason == "CLAIM_SETTLE_LOST" then
-            return finishBurst(false, confirmReason)
-        end
-
-        if targetRoot and not targetRoot:IsDescendantOf(workspace) then
-            Logger:Log("[TELEMETRY] TARGET_VANISHED_PRE_CONFIRM", Color3.new(1, 0.5, 0))
-            return finishBurst(false, "TARGET_VANISHED_PRE_CONFIRM")
-        end
-
-        if not prompt or not prompt:IsDescendantOf(workspace) then
-            Logger:Log("[TELEMETRY] NO_PROMPT_CONFIRM", Color3.new(1, 0.5, 0))
-            return finishBurst(false, "NO_PROMPT")
-        end
-
-        if not interactionObserved and not burstSignals.claimSeen and not triggeredObserved and not hasPromptHiddenAfterInteraction() and probableObservedAt <= 0 and prompt.Enabled and (tick() - lastConfirmRefireAt) >= Config.BurstFireEvery then
-            lastConfirmRefireAt = tick()
-            maintainBurstPose(charB, hrpB, false)
-            interactionObserved = true
-            lastInteractionAt = tick()
-
-            local refireOk, refireMode = performPromptInteraction(charB, hrpB, prompt)
-            if refireOk then
-                Logger:Log("[TELEMETRY] GRAB_REFIRE mode=" .. tostring(refireMode), Color3.new(1, 1, 0))
-            end
-        end
-
-        -- Triggered pero sin claim aun: el server puede haber rechazado el primer fire.
-        -- Reintenta una vez despues de 2s para darle otra oportunidad.
-        if triggeredObserved and not burstSignals.claimSeen and not hasPromptHiddenAfterInteraction()
-            and probableObservedAt <= 0
-            and prompt and prompt:IsDescendantOf(workspace) and prompt.Enabled
-            and lastInteractionAt > 0 and (tick() - lastInteractionAt) >= 2.0 then
-            lastInteractionAt = tick()
-            lastConfirmRefireAt = tick()
-            maintainBurstPose(charB, hrpB, false)
-            local retryOk, retryMode = performPromptInteraction(charB, hrpB, prompt)
-            if retryOk then
-                Logger:Log("[TELEMETRY] GRAB_TRIGGER_RETRY mode=" .. tostring(retryMode), Color3.new(1, 0.7, 0))
-            end
-        end
-
-        RS.Heartbeat:Wait()
-    end
-
-    Logger:Log("[TELEMETRY] GRAB_FAIL_NO_CONFIRM", Color3.new(1, 0.5, 0))
-    if triggeredObserved then
-        Logger:Log("[TELEMETRY] TRIGGER_WITHOUT_PICKUP_CONFIRM", Color3.new(1, 0.5, 0))
-        return finishBurst(false, "TRIGGER_WITHOUT_PICKUP_CONFIRM")
-    end
-    return finishBurst(false, "PROMPT_NOT_CONFIRMED")
-end
+local function getEnabledFiltersSummary()
+	local enabled = {}
 
--- ==============================================================================
--- 6. SECUENCIA NÚCLEO (L-SHAPE ROUTING)
--- ==============================================================================
-local function FarmRoutine(targetRoot, prompt)
-    if FSM.Phase ~= "IDLE" then return end
-    if not targetRoot or not targetRoot:IsDescendantOf(workspace) or not prompt or not prompt:IsDescendantOf(workspace) or not prompt.Enabled then return end
-    
-    local char, hrp = FSM:GetValidEntity()
-    if not hrp or not Config.Home then return end
-    if FSM:IsTargetCoolingDown(targetRoot, prompt) then return end
-
-    local blocked, reason = FSM:IsRoutineBlocked()
-    if blocked then
-        if (tick() - (FSM.LastStartBlockLogAt or 0)) > 1.0 then
-            Logger:Log("[START_BLOCKED] " .. tostring(reason), Color3.new(1, 0.5, 0))
-            FSM.LastStartBlockLogAt = tick()
-        end
-        return
-    end
-
-    FSM.TargetRoot = targetRoot 
-    FSM.TargetPrompt = prompt 
-    Motor:SetGhostMode(true) 
-    
-    local diff = (hrp.Position - targetRoot.Position) 
-    local dirXZ = Vector3.new(diff.X, 0, diff.Z) 
-    dirXZ = dirXZ.Magnitude < 0.01 and Vector3.new(1,0,0) or dirXZ.Unit 
-    local spotXZ = targetRoot.Position + (dirXZ * Config.Distancia) 
-    local cCobro, promptPos = GetBurstPickupCFrame(targetRoot, prompt)
-    
-    local posHRP = hrp.Position 
-    local cDropLocal = CFrame.lookAt(Vector3.new(posHRP.X, Config.Y_Transito, posHRP.Z), Vector3.new(spotXZ.X, Config.Y_Transito, spotXZ.Z)) 
-    local cTrans = CFrame.lookAt(Vector3.new(spotXZ.X, Config.Y_Transito, spotXZ.Z), Vector3.new(targetRoot.Position.X, Config.Y_Transito, targetRoot.Position.Z)) 
-    
-    FSM:TransitionTo("TRANSIT_DROP", "Bajar")
-    local okD, errD = Motor:Travel(cDropLocal, FSM.StateID) 
-    if not okD then if FSM.Phase == "TRANSIT_DROP" then FSM:TransitionTo("EMERGENCY", errD) end; return end 
-    
-    FSM:TransitionTo("TRANSIT_HORIZONTAL", "Acercar")
-    local okT, errT = Motor:Travel(cTrans, FSM.StateID) 
-    if not okT then if FSM.Phase == "TRANSIT_HORIZONTAL" then FSM:TransitionTo("EMERGENCY", errT) end; return end 
-    
-    FSM:TransitionTo("BURST", "Interact") 
-    local okB, errB = Motor:ExecuteBurst(targetRoot, prompt, cCobro, FSM.StateID) 
-    if not okB then 
-        if FSM.Phase == "BURST" then
-            if errB == "CARRY_SWAP_PENDING" then
-                Logger:Log("[CARRY_SWAP] pickup aceptado, esperando respawn para volver a base", Color3.new(1, 1, 0))
-                FSM:TransitionTo("DEAD", "Carry Swap Pending")
-            elseif errB == "NO_PROMPT" or errB == "PROMPT_NOT_CONFIRMED" or errB == "TRIGGER_WITHOUT_PICKUP_CONFIRM" or errB == "CLAIM_WITHOUT_CARRY_CONFIRM" or errB == "CLAIM_SETTLE_LOST" or errB == "TARGET_VANISHED_PRE_CONFIRM" then
-                FSM:MarkTargetCooldown(targetRoot, prompt, Config.TargetRetryCooldown, errB)
-                FSM:HandleBurstSoftReset(errB)
-            else
-                FSM:TransitionTo("EMERGENCY", errB)
-            end
-        end 
-        return
-    end 
-
-    local fieldStowOk, fieldStowReason = FSM:WaitForFieldPickupStow()
-    local shouldReturnHome = not fieldStowOk
-    if fieldStowOk then
-        local carryCountNow = FSM:RecordSessionPickup(fieldStowReason)
-        if carryCountNow >= math.max(Config.ReturnAt or 1, 1) then
-            shouldReturnHome = true
-            Logger:Log(string.format("[RETURN_TRIGGER] THRESHOLD %d/%d", carryCountNow, math.max(Config.ReturnAt or 1, 1)), Color3.new(0, 1, 1))
-        else
-            Logger:Log(string.format("[FIELD_STOW_OK] %s carry=%d/%d", tostring(fieldStowReason), carryCountNow, math.max(Config.ReturnAt or 1, 1)), Color3.new(0, 1, 0))
-        end
-    else
-        Logger:Log("[FIELD_STOW_PENDING] " .. tostring(fieldStowReason), Color3.new(1, 0.8, 0))
-        Logger:Log("[RETURN_TRIGGER] HARD_CARRY_PENDING", Color3.new(1, 1, 0))
-    end
-
-    if shouldReturnHome then
-        FSM:RunHomeReturn(targetRoot, prompt, fieldStowOk and "Threshold Return" or "Hard Carry Return", fieldStowOk and "SUCCESS_THRESHOLD" or "SUCCESS_HARD_CARRY")
-        return
-    end
-
-    FSM:MarkTargetCooldown(targetRoot, prompt, Config.TargetSuccessCooldown, "SUCCESS_STORED")
-    FSM:TransitionTo("IDLE", "Pickup Stored")
-    local _, safeRoot = FSM:GetValidEntity()
-    if safeRoot then
-        Motor:SealCharacter(safeRoot)
-    end
-    if not Config.Activo then
-        FSM:ReleaseCharacterIfSafe("Pickup Stored")
-    else
-        Logger:Log("[CYCLE_READY_STORED]", Color3.new(0, 1, 0))
-    end
-end
+	for _, rarityName in ipairs(filterOrder) do
+		if filtros[rarityName] then
+			table.insert(enabled, rarityName)
+		end
+	end
 
--- ==============================================================================
--- 7. EVENTOS Y CONTROL DE FLUJO
--- ==============================================================================
-table.insert(Threads, safeSpawn("Heartbeat Monitor", function()
-    while RS.Heartbeat:Wait() do
-        local char, hrp, hum = FSM:GetValidEntity()
-        if hrp and hum then
-            if not Config.Activo and FSM.Phase == "IDLE" and FSM.PendingSafeRelease and not FSM.DeadLatch then
-                local now = tick()
-                if (now - (FSM.LastReleaseAttemptAt or 0)) >= Config.AutoReleaseRetryEvery then
-                    FSM.LastReleaseAttemptAt = now
-                    local released = FSM:ReleaseCharacterIfSafe(FSM.PendingSafeReleaseReason or "Deferred Release")
-                    if not released then
-                        Motor:SealCharacter(hrp)
-                    end
-                end
-            end
-
-            if Config.Activo then
-                if FSM.Phase == "EMERGENCY" then
-                    Motor:SealCharacter(hrp)
-                    if FSM:IsHomeCFrameSafe(Config.Home) then
-                        if hrp.Position.Y < (Config.Y_Transito + 0.5) then
-                            Motor:TeleportCharacter(char, hrp, Config.Home + Vector3.new(0, 3, 0), true)
-                            FSM.EmergencyTicks = 0
-                        else
-                            local stable, reason, nextPos = FSM:CheckStabilitySample(hrp, hum, FSM.LastStabilityPos, {
-                                minY = Config.Y_Transito + 1.0,
-                                minHealth = Config.MinRecoverHealth,
-                                requireAnchored = true
-                            })
-                            FSM.LastStabilityPos = nextPos
-                            FSM.EmergencyTicks = stable and ((FSM.EmergencyTicks or 0) + 1) or 0
-                            if FSM.EmergencyTicks > Config.ReleaseStableFrames then
-                                Logger:Log("[RECOVERY] Saliendo de EMERGENCY con ventana estable", Color3.new(0, 1, 0))
-                                FSM:TransitionTo("IDLE", "Auto Recovery Stable")
-                            elseif not stable and reason == "LOW_HP" then
-                                if ((FSM.LastStartBlockLogAt or 0) + 1.0) < tick() then
-                                    Logger:Log("[RECOVERY_BLOCKED] LOW_HP_RECOVER", Color3.new(1, 0.5, 0))
-                                    FSM.LastStartBlockLogAt = tick()
-                                end
-                            end
-                        end
-                    else
-                        FSM.EmergencyTicks = 0
-                    end
-                end
-
-                local distXZ = -1
-                local dist3D = -1
-                if FSM.TargetRoot and FSM.TargetRoot.Parent then 
-                    local pPos = FSM.TargetRoot.Position
-                    dist3D = (hrp.Position - pPos).Magnitude
-                    distXZ = math.sqrt((hrp.Position.X - pPos.X)^2 + (hrp.Position.Z - pPos.Z)^2)
-                end
-                
-                Logger.Snapshots[Logger.SnapIndex] = { 
-                    t = tick(), hp = hum.Health, y = hrp.Position.Y, vy = hrp.AssemblyLinearVelocity.Y, 
-                    phase = FSM.Phase, distXZ = distXZ, dist3D = dist3D, anchored = hrp.Anchored 
-                }
-                Logger.SnapIndex = (Logger.SnapIndex % 30) + 1
-                
-                local currentHP = hum.Health 
-                local lastHP = hum:GetAttribute("LastHP") or currentHP 
-                if currentHP < lastHP and FSM.Phase ~= "IDLE" and FSM.Phase ~= "EMERGENCY" then 
-                    Logger:Log("[TELEMETRY] HP_CHANGE: " .. tostring(lastHP) .. " -> " .. tostring(currentHP), Color3.new(1, 0, 0))
-                    if currentHP <= Config.MinRecoverHealth then
-                        Logger:Dump("CRITICAL_DAMAGE") 
-                        FSM:TransitionTo("EMERGENCY", "Critical Damage Abort") 
-                    end
-                end 
-                hum:SetAttribute("LastHP", currentHP) 
-
-                if hrp.AssemblyLinearVelocity.Y < -40.0 and FSM.Phase ~= "IDLE" and FSM.Phase ~= "EMERGENCY" and FSM.Phase ~= "DEAD" then
-                    Logger:Dump("FALLING_DETECTED")
-                    FSM:TransitionTo("EMERGENCY", "Physics Fall Abort")
-                end
-            end
-        end 
-    end 
-end))
-
-table.insert(Threads, safeSpawn("Target Picker", function()
-    while task.wait(0.2) do
-        if Config.Activo and FSM.Phase == "IDLE" and not FSM:HasPendingCarrySwap() then
-            local char, hrp = FSM:GetValidEntity()
-            if hrp then
-                local folder = workspace:FindFirstChild("ActiveBrainrots")
-                if folder then
-                    local bestRoot, bestPrompt, bestCandidate = nil, nil, nil
-                    for _, rarityFolder in pairs(folder:GetChildren()) do 
-                        for _, rot in pairs(rarityFolder:GetChildren()) do
-                            local tr = rot:FindFirstChild("Root")
-                            local pr = rot:FindFirstChild("TakePrompt", true)
-                            if tr and pr and pr.Enabled and (not FSM:IsTargetCoolingDown(tr, pr)) then
-                                local candidate = evaluateTargetCandidate(rot, tr, pr, hrp)
-                                if candidate then
-                                    local shouldTake = not bestCandidate
-                                        or candidate.score > bestCandidate.score
-                                        or (candidate.score == bestCandidate.score and candidate.distance < bestCandidate.distance)
-                                    if shouldTake then
-                                        bestCandidate = candidate
-                                        bestRoot = tr
-                                        bestPrompt = pr
-                                    end
-                                end
-                            end
-                        end 
-                    end
-                    if bestRoot and bestPrompt then
-                        FarmRoutine(bestRoot, bestPrompt)
-                    elseif Config.ReturnWhenNoTargets and FSM:HasStoredSessionCarry() then
-                        Logger:Log(string.format("[RETURN_TRIGGER] SIN_TARGETS carry=%d/%d", FSM:GetSessionCarryCount(), math.max(Config.ReturnAt or 1, 1)), Color3.new(0, 1, 1))
-                        FSM:RunHomeReturn(nil, nil, "No Targets Return", "RETURN_NO_TARGETS")
-                    end
-                end
-            end
-        end
-    end
-end))
-
-local lastMutsCache = ""
-table.insert(Threads, safeSpawn("Mutation Scanner", function()
-    while task.wait(1.5) do
-        if Config.Activo then continue end
-        local folder = workspace:FindFirstChild("ActiveBrainrots"); if not folder then continue end
-        local currentMuts = {}; 
-        for _, r in pairs(folder:GetChildren()) do 
-            for _, rot in pairs(r:GetChildren()) do 
-                local m = getTargetMutation(rot)
-                if m and m ~= "None" then currentMuts[m] = true end 
-            end 
-        end
-        local keys = {}; for k in pairs(currentMuts) do table.insert(keys, k) end; table.sort(keys); 
-        local cacheString = table.concat(keys, "|")
-        if cacheString == lastMutsCache then continue end; lastMutsCache = cacheString
-
-        if not UI.ButtonPool[1] then
-            local autoButton = Instance.new("TextButton", mutScroll)
-            autoButton.Size = UDim2.new(1,-10,0,25)
-            autoButton.TextColor3 = Color3.new(1,1,1)
-            UI.ButtonPool[1] = {btn = autoButton, conn = nil}
-        end
-
-        local autoButtonData = UI.ButtonPool[1]
-        autoButtonData.btn.Visible = true
-        autoButtonData.btn.Text = "AUTO ATRIBUTOS"
-        autoButtonData.btn.BackgroundColor3 = (getActiveTargetMode() == "ATTRIBUTES") and Color3.fromRGB(0,120,200) or Color3.fromRGB(45,45,45)
-        if autoButtonData.conn then autoButtonData.conn:Disconnect() end
-        autoButtonData.conn = connectProtected(autoButtonData.btn.MouseButton1Click, function()
-            Config.Mutacion = nil
-            lastMutsCache = ""
-            refreshTitle()
-            Logger:Log("[TARGET_MODE] " .. getTargetModeSummary(), Color3.new(0, 1, 1))
-        end, "Auto Target Mode Button")
-
-        for i, m in ipairs(keys) do 
-            local poolIndex = i + 1
-            if not UI.ButtonPool[poolIndex] then 
-                local b = Instance.new("TextButton", mutScroll); b.Size = UDim2.new(1,-10,0,25); b.TextColor3 = Color3.new(1,1,1) 
-                UI.ButtonPool[poolIndex] = {btn = b, conn = nil} 
-            end 
-            local bData = UI.ButtonPool[poolIndex] 
-            bData.btn.Visible = true; bData.btn.Text = m; bData.btn.BackgroundColor3 = (Config.Mutacion == m) and Color3.fromRGB(0,120,200) or Color3.fromRGB(45,45,45) 
-            if bData.conn then bData.conn:Disconnect() end 
-            bData.conn = connectProtected(bData.btn.MouseButton1Click, function()
-                Config.Mutacion = m
-                lastMutsCache = ""
-                refreshTitle()
-                Logger:Log("[TARGET_MODE] " .. getTargetModeSummary(), Color3.new(0, 1, 1))
-            end, "Mutation Button") 
-        end 
-        for i = #keys + 2, #UI.ButtonPool do UI.ButtonPool[i].btn.Visible = false end
-    end 
-end))
-
--- ==============================================================================
--- 8. UI DRAG & CONTROLES
--- ==============================================================================
-local dragging, dragStart, startPos = false, nil, nil
-
-safeConnect(topBar.InputBegan, function(input) 
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
-        dragging = true 
-        dragStart = input.Position 
-        startPos = main.Position 
-    end 
-end, "TopBar InputBegan")
-
-safeConnect(UIS.InputChanged, function(input) 
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then 
-        local delta = input.Position - dragStart 
-        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y) 
-    end 
-end, "UIS InputChanged")
-
-safeConnect(UIS.InputEnded, function(input) 
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
-        dragging = false 
-    end 
-end, "UIS InputEnded")
-
-safeConnect(btnCopy.MouseButton1Click, function()
-    if copyToClipboard(Logger:BuildCopyPayload()) then
-        Logger:Log("LOGS COPIADOS", Color3.new(0,1,0))
-    else
-        Logger:Log("PORTAPAPELES NO DISPONIBLE", Color3.new(1,0.5,0))
-    end
-end, "Copy Button")
-
-safeConnect(btnToggle.MouseButton1Click, function()
-    UI.Minimized = not UI.Minimized
-    local newH = UI.Minimized and 30 or 315
-    main.Size = UDim2.new(0, 260, 0, newH)
-    btnToggle.Text = UI.Minimized and "+" or "−"
-    logBox.Visible = not UI.Minimized
-    mutScroll.Visible = not UI.Minimized
-    footer.Visible = not UI.Minimized
-end, "Toggle Button")
-
-safeConnect(btnAction.MouseButton1Click, function()
-    local char, hrp, hum = FSM:GetValidEntity()
-
-    if not Config.Activo then
-        if FSM.DeadLatch or FSM.Phase == "DEAD" then
-            Logger:Log("[START_BLOCKED] DEAD terminal. Esperando CharacterAdded estable.", Color3.new(1, 0.3, 0.3))
-            return
-        end
-        if not hrp or not hum then
-            Logger:Log("[START_BLOCKED] NO_ENTITY", Color3.new(1, 0.5, 0))
-            return
-        end
-        if hum.Health < Config.MinStartHealth then
-            Logger:Log("[START_BLOCKED] LOW_HP_START", Color3.new(1, 0.5, 0))
-            return
-        end
-
-        Motor:SealCharacter(hrp)
-        FSM:SaveHomeIfSafe(hrp)
-        if not FSM:IsHomeCFrameSafe(Config.Home) then
-            Logger:Log("[START_BLOCKED] HOME_INVALID", Color3.new(1, 0.5, 0))
-            return
-        end
-
-        FSM:ResetSessionCarry("START_SESSION")
-
-        Config.Activo = true
-        btnAction.Text = "DETENER"
-        btnAction.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
-
-        if hrp then
-            Motor:SealCharacter(hrp)
-        end
-        refreshTitle()
-        Logger:Log("[TARGET_MODE] " .. getTargetModeSummary(), Color3.new(0, 1, 1))
-        Logger:Log("[START_READY_SEALED]", Color3.new(0, 1, 0))
-    else
-        Config.Activo = false
-        btnAction.Text = "INICIAR"
-        btnAction.BackgroundColor3 = Color3.fromRGB(0, 150, 50)
-        FSM:StopSafely()
-    end
-end, "Action Button")
-
-safeConnect(player.CharacterRemoving, function(char)
-    Logger:Dump("CHARACTER_REMOVING")
-    local isCarrySwap = FSM.PostTriggerRemovalExpected
-    FSM.PostTriggerRemovalExpected = false
-    FSM:TransitionTo("DEAD", "CharRemoving")
-    FSM.LastStabilityPos = nil
-    FSM.Session += 1
-    if isCarrySwap and Config.BurstCarrySwapAutoResume then
-        Logger:Log("[CARRY_SWAP] CharRemoving post-trigger: mantener Activo para reanudar", Color3.new(0, 1, 1))
-    else
-        Config.Activo = false
-        btnAction.Text = "INICIAR"; btnAction.BackgroundColor3 = Color3.fromRGB(0, 150, 50)
-    end
-end, "CharacterRemoving")
-
-safeConnect(player.CharacterAdded, function(char)
-    FSM.LastRespawnAt = tick()
-    FSM.LastStabilityPos = nil
-    FSM:ClearTargets()
-    Logger:Log("[RESPAWN] CharacterAdded detectado", Color3.new(0, 1, 1))
-
-    safeSpawn("CharacterAdded Resume", function()
-        task.wait(0.4)
-        local respawnStamp = FSM.LastRespawnAt
-        local ok, reason = FSM:WaitForStableWindow(Config.RespawnStableFrames, {
-            minY = Config.Y_Transito + 1.0,
-            minHealth = Config.MinRecoverHealth,
-            requireAnchored = false,
-            maxFrames = 90,
-            allowMissingEntityFrames = 45
-        })
-        if FSM.LastRespawnAt ~= respawnStamp then return end
-
-        local _, respawnRoot = FSM:GetValidEntity()
-        if ok and respawnRoot then
-            Motor:SealCharacter(respawnRoot)
-            FSM.DeadLatch = false
-            if FSM.Phase == "DEAD" then
-                FSM:TransitionTo("IDLE", "CharacterAdded Stable")
-            end
-
-            if FSM:HasPendingCarrySwap() then
-                Logger:Log("[CARRY_SWAP] Verificando pickup tras respawn", Color3.new(0, 1, 1))
-                local pending = FSM.PendingCarrySwap
-                local swapOk, swapReason = FSM:WaitForCarrySwapResolution()
-                if swapOk then
-                    Logger:Log("[CARRY_SWAP] PICKUP_CONFIRMADO: " .. tostring(swapReason), Color3.new(0, 1, 0))
-                    local returnChar, returnRoot = FSM:GetValidEntity()
-                    if returnRoot and FSM:IsHomeCFrameSafe(Config.Home) then
-                        FSM:TransitionTo("RETURN", "Carry Swap Resume")
-                        local clearedCarry, carryClearReason = FSM:ExecuteHomeUnloadSequence()
-                        if not clearedCarry and (carryClearReason == "HOME_INVALID" or carryClearReason == "NO_ENTITY") then
-                            Logger:Log("[CARRY_SWAP] RETURN_FAIL: " .. tostring(carryClearReason), Color3.new(1, 0.5, 0))
-                            FSM:ClearPendingCarrySwap()
-                            FSM:TransitionTo("EMERGENCY", carryClearReason)
-                            return
-                        end
-                        if clearedCarry then
-                            Logger:Log("[RETURN_CLEAR] carry descargado", Color3.new(0, 1, 0))
-                            local _, _, clearHum = FSM:GetValidEntity()
-                            if clearHum then
-                                TryUnequipEquippedTool(clearHum, "CARRY_SWAP_CLEAR")
-                            end
-                        else
-                            Logger:Log("[RETURN_CLEAR_PENDING] " .. tostring(carryClearReason), Color3.new(1, 0.8, 0))
-                        end
-                        FSM:MarkTargetCooldown(pending and pending.targetRoot, pending and pending.prompt, Config.TargetSuccessCooldown, "CARRY_SWAP_SUCCESS")
-                        FSM:ClearPendingCarrySwap()
-                        FSM:TransitionTo("IDLE", clearedCarry and "Carry Swap Success" or "Carry Swap Pending Clear")
-                        if not Config.Activo then
-                            FSM:RequestSafeRelease(clearedCarry and "Carry Swap Success" or "Carry Swap Pending Clear")
-                        elseif not clearedCarry then
-                            Logger:Log("[CYCLE_BLOCKED] esperando descarga home", Color3.new(1, 0.8, 0))
-                        else
-                            Logger:Log("[CYCLE_READY_SEALED]", Color3.new(0, 1, 0))
-                        end
-                    else
-                        Logger:Log("[CARRY_SWAP] HOME_INVALID_POST_RESPAWN", Color3.new(1, 0.5, 0))
-                        FSM:ClearPendingCarrySwap()
-                    end
-                else
-                    Logger:Log("[CARRY_SWAP] Sin confirmacion tras respawn: " .. tostring(swapReason), Color3.new(1, 0.5, 0))
-                    FSM:ClearPendingCarrySwap()
-                end
-            end
-
-            if not Config.Activo then
-                FSM:RequestSafeRelease("Respawn Stable")
-            end
-            Logger:Log("[RESPAWN_READY] Character estable", Color3.new(0, 1, 0))
-        else
-            Logger:Log("[RESPAWN_UNSTABLE] " .. tostring(reason), Color3.new(1, 0.5, 0))
-        end
-    end)
-end, "CharacterAdded")
-
-_G.IvanFarmer_Cleanup = function()
-    Config.Activo = false; FSM.Session += 1
-    for _, conn in ipairs(Connections) do pcall(function() conn:Disconnect() end) end
-    table.clear(Connections)
-    for _, th in ipairs(Threads) do pcall(function() task.cancel(th) end) end
-    table.clear(Threads)
-    FSM:TransitionTo("IDLE", "Cleanup") 
-    destroyExistingGui()
+	return #enabled > 0 and table.concat(enabled, ",") or "none"
 end
 
-refreshTitle()
-Logger:Log("V236 Attribute Targeting Ready.", Color3.new(0, 1, 0.4))
-Logger:Log("[TARGET_MODE] " .. getTargetModeSummary(), Color3.new(0, 1, 1))
-Logger:Log(string.format("[CONFIG] PromptRootOff=%.2f | Dist=%.1f | StartHP=%.0f | RecoverHP=%.0f | Burst=%s | PromptMax=%.0f | HoldSpoof=%s | Attempts=%d | RetryCD=%.2f | ReturnAt=%d", Config.BurstPromptRootOffset, Config.Distancia, Config.MinStartHealth, Config.MinRecoverHealth, Config.BurstMode, Config.BurstPromptMaxDistance, tostring(Config.BurstSpoofHoldDuration), Config.BurstRapidAttempts, Config.TargetRetryCooldown, math.max(Config.ReturnAt or 1, 1)), Color3.new(0, 1, 1))
+local function getDisabledRarityHint(disabledWithCandidates)
+	local available = {}
+
+	for _, rarityName in ipairs(filterOrder) do
+		if disabledWithCandidates[rarityName] then
+			table.insert(available, rarityName)
+		end
+	end
+
+	if #available == 0 then
+		return ""
+	end
+
+	if #available > 4 then
+		return table.concat(available, ",", 1, 4) .. ",..."
+	end
+
+	return table.concat(available, ",")
+end
+
+local function collectTargetsFromContainer(container, results, scanStats)
+	if not container then
+		return
+	end
+
+	for _, descendant in ipairs(container:GetDescendants()) do
+		if isBrainrotCandidate(descendant) then
+			if scanStats then
+				scanStats.candidates = scanStats.candidates + 1
+			end
+			local rarityName = getTargetRarity(descendant)
+			if filtros[rarityName] then
+				local invalidReason = getInvalidTargetReason(descendant)
+				if not invalidReason then
+					appendTargetIfValid(results, descendant)
+				elseif scanStats then
+					noteScanReason(scanStats.invalidReasons, invalidReason)
+				end
+			elseif scanStats then
+				scanStats.filteredOut = scanStats.filteredOut + 1
+			end
+		end
+	end
+end
+
+local function releaseAutopilot(reason, status)
+	local root = getRoot()
+	if root then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	autoPilot = false
+	if not eventShieldMode then
+		restoreCharacterCollisionState()
+	end
+
+	local humanoid = getHumanoid()
+	if humanoid then
+		humanoid.PlatformStand = false
+	end
+
+	if reason then
+		status.Text = reason
+	end
+	debugLog("AUTOPILOT_OFF", reason or "sin motivo")
+
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+end
+
+local function refreshTargets(force)
+	local now = os.clock()
+	local scanStats = {
+		folders = 0,
+		candidates = 0,
+		filteredOut = 0,
+		disabledWithCandidates = {},
+		invalidReasons = {},
+		usedFallback = false,
+	}
+
+	if forceRescan then
+		force = true
+		forceRescan = false
+	end
+
+	if not force and (now - lastScan) < scanInterval then
+		return targetCache, #targetCache
+	end
+
+	lastScan = now
+	targetCache = {}
+
+	local brainrots = workspace:FindFirstChild("ActiveBrainrots")
+	if not brainrots then
+		scanStats.usedFallback = true
+		collectTargetsFromContainer(workspace, targetCache, scanStats)
+		if #targetCache > 0 then
+			debugLog("SCAN_FALLBACK", "usando workspace completo, targets=" .. tostring(#targetCache))
+		end
+		debugOnce(
+			"SCAN",
+			string.format(
+				"ActiveBrainrots no existe targets=%d candidates=%d invalid=%s filters=%s",
+				#targetCache,
+				scanStats.candidates,
+				formatReasonCounts(scanStats.invalidReasons),
+				getEnabledFiltersSummary()
+			),
+			"missing:" .. tostring(#targetCache) .. ":" .. formatReasonCounts(scanStats.invalidReasons) .. ":" .. getEnabledFiltersSummary()
+		)
+		return targetCache, #targetCache
+	end
+
+	for _, rarityFolder in ipairs(brainrots:GetChildren()) do
+		scanStats.folders = scanStats.folders + 1
+		local resolvedFolderName = resolveRarityName(rarityFolder.Name)
+		if filtros[resolvedFolderName] then
+			for _, descendant in ipairs(rarityFolder:GetDescendants()) do
+				if isBrainrotCandidate(descendant) then
+					scanStats.candidates = scanStats.candidates + 1
+					local invalidReason = getInvalidTargetReason(descendant)
+					if not invalidReason then
+						table.insert(targetCache, descendant)
+					else
+						noteScanReason(scanStats.invalidReasons, invalidReason)
+					end
+				end
+			end
+		else
+			scanStats.filteredOut = scanStats.filteredOut + 1
+			if rarityFolder:FindFirstChild("RenderedBrainrot", true) then
+				scanStats.disabledWithCandidates[resolvedFolderName] = true
+			end
+		end
+	end
+
+	if #targetCache == 0 then
+		scanStats.usedFallback = true
+		collectTargetsFromContainer(workspace, targetCache, scanStats)
+		if #targetCache > 0 then
+			debugLog("SCAN_FALLBACK", "ActiveBrainrots vacio, usando workspace completo targets=" .. tostring(#targetCache))
+		end
+	end
+
+	table.sort(targetCache, function(a, b)
+		if towerPriorityMode then
+			local ta, la = getTowerPriority(a)
+			local tb, lb = getTowerPriority(b)
+
+			if ta ~= tb then
+				return ta > tb
+			end
+
+			if la ~= lb then
+				return la > lb
+			end
+		end
+
+		local pa = getTargetPriority(a)
+		local pb = getTargetPriority(b)
+
+		if pa ~= pb then
+			return pa > pb
+		end
+
+		local root = getRoot()
+		if not root then
+			return false
+		end
+
+		local posa = getTargetPosition(a)
+		local posb = getTargetPosition(b)
+		if not posa then
+			return false
+		end
+		if not posb then
+			return true
+		end
+
+		return (root.Position - posa).Magnitude < (root.Position - posb).Magnitude
+	end)
+
+	local topTarget = targetCache[1]
+	if #targetCache == 0 then
+		local disabledHint = getDisabledRarityHint(scanStats.disabledWithCandidates)
+		if disabledHint ~= "" then
+			lastScanHint = "SIN TARGETS. ACTIVA: " .. disabledHint
+		else
+			lastScanHint = "SIN TARGETS DISPONIBLES"
+		end
+	else
+		lastScanHint = ""
+	end
+	local summary = table.concat({
+		tostring(#targetCache),
+		tostring(topTarget and getTargetRarity(topTarget) or "none"),
+		tostring(scanStats.candidates),
+		formatReasonCounts(scanStats.invalidReasons),
+		getEnabledFiltersSummary(),
+		tostring(scanStats.usedFallback),
+	}, ":")
+	debugOnce(
+		"SCAN",
+		string.format(
+			"targets=%d top=%s tower=%s folders=%d candidates=%d filtered=%d invalid=%s fallback=%s filters=%s",
+			#targetCache,
+			topTarget and getTargetRarity(topTarget) or "none",
+			tostring(towerPriorityMode),
+			scanStats.folders,
+			scanStats.candidates,
+			scanStats.filteredOut,
+			formatReasonCounts(scanStats.invalidReasons),
+			tostring(scanStats.usedFallback),
+			getEnabledFiltersSummary()
+		),
+		summary
+	)
+
+	return targetCache, #targetCache
+end
+
+local function hasHighPriorityTarget()
+	refreshTargets(false)
+	for _, target in ipairs(targetCache) do
+		local rarityName = getTargetRarity(target)
+		if rarityName == "Infinite"
+			or rarityName == "Divine"
+			or rarityName == "Celestial"
+		then
+			return true, target
+		end
+	end
+	return false, nil
+end
+
+local function getClosestTarget()
+	local cache, availableCount = refreshTargets(false)
+
+	if currentTarget and isValidTarget(currentTarget) and isPreferredLiveTarget(currentTarget) then
+		local currentPriority = getTargetPriority(currentTarget)
+		for _, candidate in ipairs(cache) do
+			if candidate ~= currentTarget and isValidTarget(candidate) and isPreferredLiveTarget(candidate) then
+				local candidatePriority = getTargetPriority(candidate)
+				if candidatePriority > currentPriority then
+					currentTarget = candidate
+					debugOnce(
+						"TARGET_LOCK",
+						"upgrade -> " .. getTargetRarity(currentTarget) .. " | " .. currentTarget:GetFullName(),
+						currentTarget:GetFullName()
+					)
+					return currentTarget, availableCount
+				end
+				break
+			end
+		end
+		return currentTarget, availableCount
+	end
+
+	currentTarget = nil
+	for _, candidate in ipairs(cache) do
+		if isValidTarget(candidate) and isPreferredLiveTarget(candidate) then
+			currentTarget = candidate
+			break
+		end
+	end
+	if currentTarget then
+		debugOnce(
+			"TARGET_LOCK",
+			"pick -> " .. getTargetRarity(currentTarget) .. " | " .. currentTarget:GetFullName(),
+			currentTarget:GetFullName()
+		)
+	end
+	return currentTarget, availableCount
+end
+
+local function tweenTo(goal, runToken)
+	local startPos = flyValue.Value.Position
+	local distance = (startPos - goal.Position).Magnitude
+	if distance <= 0.5 then
+		flyValue.Value = goal
+		return true
+	end
+
+	local speed = firstTripPending and firstTripSpeed or farmSpeed
+	local duration = math.clamp(distance / speed, 0.05, 3)
+	debugLog("TRAVEL_TWEEN", string.format("distance=%.2f speed=%.2f duration=%.2f", distance, speed, duration))
+	local tween = TS:Create(flyValue, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Value = goal})
+	local finished = false
+	local state = nil
+	local conn
+	conn = tween.Completed:Connect(function(playbackState)
+		finished = true
+		state = playbackState
+	end)
+	tween:Play()
+
+	local deadline = os.clock() + duration + 0.4
+	while not finished and os.clock() < deadline do
+		if runToken ~= nil and not isOperationValid(runToken) then
+			pcall(function()
+				tween:Cancel()
+			end)
+			debugLog("TRAVEL_ABORT", "operacion invalidada")
+			return false
+		end
+		task.wait()
+	end
+
+	if conn then
+		conn:Disconnect()
+	end
+
+	if not finished then
+		pcall(function()
+			tween:Cancel()
+		end)
+		flyValue.Value = goal
+		return false
+	end
+
+	return state == Enum.PlaybackState.Completed
+		or state == Enum.PlaybackState.Cancelled
+		or state == nil
+end
+
+local function resolveTravelY(targetPos, forcedY, respectBaseClamp)
+	local fallenLimit = workspace.FallenPartsDestroyHeight or -500
+	local minSafeY = fallenLimit + 25
+	local referenceY = travelBaseY or (basePos and basePos.Y) or targetPos.Y
+	local safeY = forcedY or (referenceY + safeDepth)
+	safeY = math.max(safeY, minSafeY)
+
+	if respectBaseClamp and travelBaseY then
+		safeY = math.max(safeY, travelBaseY - 18)
+	elseif respectBaseClamp and basePos then
+		safeY = math.max(safeY, basePos.Y - 18)
+	end
+
+	return safeY
+end
+
+local function ghostTravel(targetPos, forcedY, respectBaseClamp, runToken)
+	local root = getRoot()
+	if not root then
+		debugLog("TRAVEL_FAIL", "sin root para viajar")
+		return false
+	end
+
+	local safeY = resolveTravelY(targetPos, forcedY, respectBaseClamp ~= false)
+	debugLog(
+		"TRAVEL_PATH",
+		string.format("from=(%.2f, %.2f, %.2f) to=(%.2f, %.2f, %.2f) safeY=%.2f", root.Position.X, root.Position.Y, root.Position.Z, targetPos.X, targetPos.Y, targetPos.Z, safeY)
+	)
+
+	debugLog("TRAVEL_STAGE", "pre-rise")
+	local startPos = flyValue.Value.Position
+	flyValue.Value = CFrame.new(startPos.X, safeY, startPos.Z)
+	task.wait(0.03)
+	debugLog("TRAVEL_STAGE", "post-rise")
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("TRAVEL_ABORT", "invalidada antes de tween")
+		return false
+	end
+
+	local goal = CFrame.new(targetPos.X, safeY, targetPos.Z)
+	debugLog("TRAVEL_STAGE", "pre-tween")
+	local reached = tweenTo(goal, runToken)
+	debugLog("TRAVEL_STAGE", "post-tween")
+	local updatedRoot = getRoot()
+	local remainingDistance = updatedRoot and (updatedRoot.Position - goal.Position).Magnitude or -1
+	debugLog("TRAVEL_RESULT", string.format("ok=%s remaining=%.2f", tostring(reached), remainingDistance))
+	return reached
+end
+
+local function ghostReturnTravel(targetPos, runToken)
+	local root = getRoot()
+	if not root or not basePos then
+		return false
+	end
+
+	local cruiseY = math.max(basePos.Y + safeDepth, root.Position.Y - 1.5)
+	cruiseY = resolveTravelY(targetPos, cruiseY, false)
+	return ghostTravel(targetPos, cruiseY, false, runToken)
+end
+
+local function emergencyRecover(status)
+	local root = getRoot()
+	if not root then
+		return
+	end
+	local fallback = basePos and Vector3.new(basePos.X, math.max(basePos.Y - 1, root.Position.Y), basePos.Z)
+		or Vector3.new(root.Position.X, root.Position.Y, root.Position.Z)
+	ghostTravel(fallback)
+	status.Text = "RECUPERANDO RUTA..."
+end
+
+local function getGoalDistance(goal)
+	local root = getRoot()
+	if not root then
+		return math.huge
+	end
+	return (root.Position - goal.Position).Magnitude
+end
+
+local function snapCharacterTo(goal)
+	local character = LP.Character
+	local root = getRoot()
+	if not root then
+		return false
+	end
+
+	flyValue.Value = goal
+	pcall(function()
+		if character then
+			character:PivotTo(goal)
+		else
+			root.CFrame = goal
+		end
+	end)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	return true
+end
+
+local function approachStPatricPrompt(promptPos, runToken)
+	if not promptPos then
+		return false
+	end
+
+	local root = getRoot()
+	if root and (root.Position - promptPos).Magnitude > 10 then
+		ghostTravel(promptPos, nil, nil, runToken)
+	end
+
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("STP_POT_APPROACH_ABORT", "operacion invalidada antes de ajuste final")
+		return false
+	end
+
+	local finalY = math.max(resolveTravelY(promptPos, nil, true), promptPos.Y + stPatricPromptHeightOffset)
+	local finalGoal = CFrame.new(promptPos.X, finalY, promptPos.Z)
+	local reached = tweenTo(finalGoal, runToken)
+	if not reached or getGoalDistance(finalGoal) > 4 then
+		snapCharacterTo(finalGoal)
+	end
+
+	local updatedRoot = getRoot()
+	local remaining = updatedRoot and (updatedRoot.Position - finalGoal.Position).Magnitude or -1
+	debugLog("STP_POT_APPROACH", string.format("promptY=%.2f finalY=%.2f remaining=%.2f", promptPos.Y, finalY, remaining))
+	return true
+end
+
+local function descendAfterStPatricSubmit(runToken)
+	local root = getRoot()
+	if not root then
+		return false
+	end
+
+	local safeY = resolveTravelY(root.Position, nil, true)
+	local descendGoal = CFrame.new(root.Position.X, safeY, root.Position.Z)
+	local reached = tweenTo(descendGoal, runToken)
+	if not reached or getGoalDistance(descendGoal) > 3 then
+		snapCharacterTo(descendGoal)
+	end
+
+	debugLog("STP_EXIT_POT", string.format("fromY=%.2f toY=%.2f", root.Position.Y, safeY))
+	return true
+end
+
+local function finalizeStPatricSubmitSuccess(status, runToken, carryCount, toolsBefore, toolsNow, dialogScore, dialogPath, eventName)
+	captureBaselineTools()
+	invCount = 0
+	grabAttempts = 0
+	currentTarget = nil
+	blacklist = {}
+	returnLocked = false
+	isReturning = false
+	refreshTargets(true)
+	status.Text = "STP: ENTREGA OK"
+	debugLog(eventName or "STP_SUBMIT_OK", "carry_before=" .. tostring(carryCount) .. " tools_before=" .. tostring(toolsBefore) .. " tools_now=" .. tostring(toolsNow) .. " dialog_score=" .. tostring(dialogScore) .. " dialog_path=" .. tostring(dialogPath or "none"))
+	descendAfterStPatricSubmit(runToken)
+	releaseAutopilot("STP: BUSCANDO BRAINROTS...", status)
+	return true
+end
+
+local function getReturnTunnelY()
+	if not basePos then
+		return nil
+	end
+	return basePos.Y + returnApproachDepth
+end
+
+local function getReturnWallWaypoint()
+	if not basePos then
+		return nil
+	end
+
+	local root = getRoot()
+	if not root then
+		return Vector3.new(basePos.X + returnWallOffset, getReturnTunnelY() or basePos.Y, basePos.Z)
+	end
+
+	local delta = root.Position - basePos
+	local tunnelY = getReturnTunnelY() or basePos.Y
+	if math.abs(delta.X) >= math.abs(delta.Z) then
+		local direction = delta.X >= 0 and 1 or -1
+		return Vector3.new(basePos.X + (direction * returnWallOffset), tunnelY, basePos.Z)
+	end
+
+	local direction = delta.Z >= 0 and 1 or -1
+	return Vector3.new(basePos.X, tunnelY, basePos.Z + (direction * returnWallOffset))
+end
+
+local function moveReturnStage(goal, status, recoveryText, runToken)
+	local reached = tweenTo(goal, runToken)
+	if reached and getGoalDistance(goal) <= returnGoalTolerance then
+		return true
+	end
+
+	if recoveryText and status then
+		status.Text = recoveryText
+		debugLog("RETURN_RECOVER", recoveryText)
+	end
+
+	snapCharacterTo(goal)
+	task.wait(0.05)
+	return getGoalDistance(goal) <= returnGoalTolerance + 1
+end
+
+local function moveReturnTunnel(targetPos, status, recoveryText, runToken)
+	local tunnelY = getReturnTunnelY()
+	if not tunnelY then
+		return false
+	end
+
+	local reached = ghostTravel(targetPos, tunnelY, false, runToken)
+	local goal = CFrame.new(targetPos.X, tunnelY, targetPos.Z)
+	if reached and getGoalDistance(goal) <= returnGoalTolerance + 0.5 then
+		return true
+	end
+
+	if recoveryText and status then
+		status.Text = recoveryText
+		debugLog("RETURN_RECOVER", recoveryText)
+	end
+
+	return moveReturnStage(goal, status, nil, runToken)
+end
+
+local function grabItem(target, runToken)
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("GRAB_ABORT", "operacion invalidada antes de iniciar")
+		return false
+	end
+	local carryCount = getEffectiveCarryCount()
+	if carryCount >= returnAt then
+		returnLocked = true
+		debugLog("GRAB_ABORT", "limite alcanzado carry=" .. tostring(carryCount) .. "/" .. tostring(returnAt))
+		return false
+	end
+	if not isValidTarget(target) then
+		debugLog("GRAB_SKIP", "target invalido")
+		return false
+	end
+
+	isGrabbing = true
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+	local humanoid = getHumanoid()
+	local root = getRoot()
+	local healthBefore = humanoid and humanoid.Health or 100
+	local farmToolsBefore = getFarmToolCount()
+	debugLog(
+		"GRAB_START",
+		string.format(
+			"target=%s rarity=%s dist=%.2f inv=%d tools=%d",
+			target.Name,
+			getTargetRarity(target),
+			(root and getTargetPosition(target)) and (root.Position - getTargetPosition(target)).Magnitude or -1,
+			invCount,
+			farmToolsBefore
+		)
+	)
+	local prompt = findPrompt(target)
+	if not prompt then
+		debugLog("GRAB_FAIL", "sin prompt")
+		isGrabbing = false
+		if mainButton then
+			updateButtonState(mainButton)
+		end
+		return false
+	end
+	local activeBrainrots = workspace:FindFirstChild("ActiveBrainrots")
+
+	local function isClaimConfirmed()
+		if target and activeBrainrots and not target:IsDescendantOf(activeBrainrots) then
+			return true, "target salio de ActiveBrainrots"
+		end
+		if prompt and prompt.Parent then
+			if target and not prompt:IsDescendantOf(target) then
+				return true, "prompt movido fuera del target"
+			end
+			if activeBrainrots and not prompt:IsDescendantOf(activeBrainrots) then
+				return true, "prompt salio de ActiveBrainrots"
+			end
+		end
+		return false, nil
+	end
+
+	local triggered = false
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+		prompt.MaxActivationDistance = 100
+		prompt.HoldDuration = 0
+	end)
+	debugLog(
+		"GRAB_PROMPT",
+		string.format(
+			"path=%s action=%s object=%s max=%.1f hold=%.2f enabled=%s",
+			prompt:GetFullName(),
+			tostring(prompt.ActionText),
+			tostring(prompt.ObjectText),
+			prompt.MaxActivationDistance,
+			prompt.HoldDuration,
+			tostring(prompt.Enabled)
+		)
+	)
+
+	task.wait(0.15)
+
+	for attempt = 1, 4 do
+		if runToken ~= nil and not isOperationValid(runToken) then
+			debugLog("GRAB_ABORT", "operacion invalidada durante trigger")
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return false
+		end
+		local claimedBeforeFire, claimedBeforeFireReason = isClaimConfirmed()
+		if claimedBeforeFire then
+			debugLog("GRAB_OK", claimedBeforeFireReason)
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return true
+		end
+		if not isValidTarget(target) then
+			debugLog("GRAB_OK", "target desaparecio antes de terminar")
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return true
+		end
+
+		local fireOk, fireErr = pcall(function()
+			fireproximityprompt(prompt)
+		end)
+		triggered = fireOk or triggered
+		if attempt == 1 or not fireOk or fireErr then
+			debugLog(
+				"GRAB_TRIGGER",
+				"prompt=" .. prompt:GetFullName() .. " ok=" .. tostring(fireOk) .. (fireErr and (" err=" .. tostring(fireErr)) or "") .. " attempt=" .. tostring(attempt)
+			)
+		end
+
+		local claimed, claimedReason = isClaimConfirmed()
+		if claimed then
+			debugLog("GRAB_OK", claimedReason)
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return true
+		end
+
+		if humanoid and humanoid.Health > 0 and humanoid.Health < healthBefore - 20 then
+			debugLog("GRAB_FAIL", "daño alto durante agarre")
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return false
+		end
+
+		task.wait(0.08)
+	end
+
+	local deadline = os.clock() + 0.75
+	while os.clock() < deadline do
+		if runToken ~= nil and not isOperationValid(runToken) then
+			debugLog("GRAB_ABORT", "operacion invalidada esperando confirmacion")
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return false
+		end
+		local farmToolCount = getFarmToolCount()
+		local claimed, claimedReason = isClaimConfirmed()
+		if claimed then
+			debugLog("GRAB_OK", claimedReason)
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return true
+		end
+		if farmToolCount > farmToolsBefore then
+			debugLog("GRAB_OK", "tool detectada nueva=" .. tostring(farmToolCount))
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return true
+		end
+		if not target:IsDescendantOf(workspace) then
+			debugLog("GRAB_OK", "target removido de workspace")
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return true
+		end
+		if not findPrompt(target) then
+			debugLog("GRAB_OK", "prompt ya no existe")
+			isGrabbing = false
+			if mainButton then
+				updateButtonState(mainButton)
+			end
+			return true
+		end
+		task.wait(0.05)
+	end
+
+	isGrabbing = false
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+	debugLog("GRAB_FAIL", triggered and "trigger sin confirmacion" or "no trigger")
+	return false
+end
+
+local function stopFarm(reason, btn, status, keepWatching)
+	invalidateRunToken(reason or "stopFarm")
+	autoPilot = false
+	isReturning = false
+	isGrabbing = false
+	returnLocked = false
+
+	local humanoid = getHumanoid()
+	if humanoid then
+		humanoid.PlatformStand = false
+	end
+
+	if not keepWatching then
+		watchMode = false
+		resetSessionProgress()
+		updateButtonState(btn)
+	end
+
+	status.Text = reason or (keepWatching and "VIGILANDO LIBRE..." or "ESTADO: ESPERANDO")
+	resetRunState()
+	updateButtonState(btn)
+end
+
+local function returnToBase(status, reasonText, runToken)
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("RETURN_ABORT", "operacion invalidada antes de iniciar")
+		return false
+	end
+	if not basePos then
+		debugLog("RETURN_SKIP", "sin basePos")
+		return false
+	end
+
+	lastDepositAttempt = os.clock()
+
+	isReturning = true
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+	if not engageAutopilot(reasonText, status) then
+		debugLog("RETURN_FAIL", "no pudo activar autopilot")
+		isReturning = false
+		if mainButton then
+			updateButtonState(mainButton)
+		end
+		return false
+	end
+
+	local returnPos = Vector3.new(basePos.X, basePos.Y, basePos.Z)
+	debugLog(
+		"RETURN_START",
+		string.format("inv=%d tools=%d base=(%.2f, %.2f, %.2f)", invCount, syncInventoryCountFromTools(), basePos.X, basePos.Y, basePos.Z)
+	)
+	local reached = ghostReturnTravel(returnPos, runToken)
+	if not reached then
+		debugLog("RETURN_ROUTE", "fallo ruta principal, usando recover")
+		if runToken ~= nil and not isOperationValid(runToken) then
+			debugLog("RETURN_ABORT", "operacion invalidada tras ruta principal")
+			isReturning = false
+			return false
+		end
+		emergencyRecover(status)
+		if runToken ~= nil and not isOperationValid(runToken) then
+			debugLog("RETURN_ABORT", "operacion invalidada durante recover")
+			isReturning = false
+			return false
+		end
+		ghostReturnTravel(returnPos, runToken)
+	end
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("RETURN_ABORT", "operacion invalidada despues del retorno")
+		isReturning = false
+		return false
+	end
+
+	local root = getRoot()
+	local humanoid = getHumanoid()
+	if not root or not humanoid then
+		debugLog("RETURN_FAIL", "sin root o humanoid al volver")
+		isReturning = false
+		return false
+	end
+	local trackedHealth = logHealthState("return_start", humanoid)
+
+	local wallWaypoint = getReturnWallWaypoint()
+	local tunnelStage = CFrame.new(basePos.X, basePos.Y + returnApproachDepth, basePos.Z)
+	local stageOne = CFrame.new(basePos.X, basePos.Y + returnSettleDepth, basePos.Z)
+	local stageTwo = CFrame.new(basePos.X, basePos.Y + returnHoverDepth, basePos.Z)
+
+	if wallWaypoint then
+		debugLog("RETURN_STAGE", "wallWaypoint")
+		moveReturnTunnel(wallWaypoint, status, "PEGANDOSE A LA PARED...", runToken)
+		if runToken ~= nil and not isOperationValid(runToken) then
+			debugLog("RETURN_ABORT", "operacion invalidada en wallWaypoint")
+			isReturning = false
+			return false
+		end
+		trackedHealth = logHealthState("after_wallWaypoint", humanoid, trackedHealth)
+	end
+
+	debugLog("RETURN_STAGE", "tunnelStage")
+	moveReturnStage(tunnelStage, status, "ENTRANDO POR ABAJO...", runToken)
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("RETURN_ABORT", "operacion invalidada en tunnelStage")
+		isReturning = false
+		return false
+	end
+	trackedHealth = logHealthState("after_tunnelStage", humanoid, trackedHealth)
+	task.wait(0.08)
+	debugLog("RETURN_STAGE", "stageOne")
+	moveReturnStage(stageOne, status, "BAJANDO AL RETORNO...", runToken)
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("RETURN_ABORT", "operacion invalidada en stageOne")
+		isReturning = false
+		return false
+	end
+	trackedHealth = logHealthState("after_stageOne", humanoid, trackedHealth)
+	task.wait(0.08)
+	debugLog("RETURN_STAGE", "stageTwo")
+	moveReturnStage(stageTwo, status, "LLEGANDO A HOME...", runToken)
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("RETURN_ABORT", "operacion invalidada en stageTwo")
+		isReturning = false
+		return false
+	end
+	trackedHealth = logHealthState("after_stageTwo", humanoid, trackedHealth)
+	task.wait(0.08)
+
+	status.Text = "DESCARGANDO EN HOME..."
+	local unequipped = forceUnequipFarmTools(humanoid)
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("RETURN_ABORT", "operacion invalidada al desequipar")
+		isReturning = false
+		return false
+	end
+	trackedHealth = logHealthState("after_unequip", humanoid, trackedHealth)
+	task.wait(0.12)
+	captureBaselineTools()
+	invCount = 0
+	sessionGrabCount = 0
+	grabAttempts = 0
+	currentTarget = nil
+	blacklist = {}
+	refreshTargets(true)
+	returnLocked = false
+	status.Text = "HOME OK"
+	debugLog("RETURN_OK", "home reached unequip=" .. tostring(unequipped) .. " tools=" .. tostring(getFarmToolCount()))
+
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	releaseAutopilot("VIGILANDO LIBRE...", status)
+	isReturning = false
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+	debugLog("RETURN_END", "returnLocked=" .. tostring(returnLocked) .. " inv=" .. tostring(invCount))
+	return true
+end
+
+local function getStPatricTargets()
+	local results = {}
+	local brainrots = workspace:FindFirstChild("ActiveBrainrots")
+	local containers = brainrots and {brainrots} or {workspace}
+
+	for _, container in ipairs(containers) do
+		for _, descendant in ipairs(container:GetDescendants()) do
+			if isBrainrotCandidate(descendant) and isValidTarget(descendant) and isPreferredLiveTarget(descendant) then
+				appendTargetIfValid(results, descendant)
+			end
+		end
+	end
+
+	local carryCount = getEffectiveCarryCount()
+	local preferClosest = carryCount >= math.max(1, returnAt - stPatricNearFullMargin)
+
+	table.sort(results, function(a, b)
+		local root = getRoot()
+		if not root then
+			local pa = getTargetPriority(a)
+			local pb = getTargetPriority(b)
+			if pa ~= pb then
+				return pa > pb
+			end
+			return safeInstancePath(a) < safeInstancePath(b)
+		end
+
+		local posa = getTargetPosition(a)
+		local posb = getTargetPosition(b)
+		if not posa then
+			return false
+		end
+		if not posb then
+			return true
+		end
+
+		if preferClosest then
+			local distA = (root.Position - posa).Magnitude
+			local distB = (root.Position - posb).Magnitude
+			if math.abs(distA - distB) > 12 then
+				return distA < distB
+			end
+		end
+
+		local pa = getTargetPriority(a)
+		local pb = getTargetPriority(b)
+
+		if pa ~= pb then
+			return pa > pb
+		end
+
+		return (root.Position - posa).Magnitude < (root.Position - posb).Magnitude
+	end)
+
+	return results
+end
+
+local function getStPatricTarget()
+	local targets = getStPatricTargets()
+	local target = targets[1]
+	if target and currentTarget ~= target then
+		debugOnce(
+			"STP_TARGET",
+			"pick -> " .. getTargetRarity(target) .. " | " .. safeInstancePath(target),
+			safeInstancePath(target)
+		)
+	end
+	return target, #targets
+end
+
+local function getWorldPositionFromInstance(instance)
+	if not instance then
+		return nil
+	end
+
+	if safeIsA(instance, "Attachment") then
+		local position = nil
+		pcall(function()
+			position = instance.WorldPosition
+		end)
+		return position
+	end
+
+	if safeIsA(instance, "BasePart") then
+		local position = nil
+		pcall(function()
+			position = instance.Position
+		end)
+		return position
+	end
+
+	if safeIsA(instance, "Model") then
+		local ok, pivot = pcall(function()
+			return instance:GetPivot()
+		end)
+		if ok and pivot then
+			return pivot.Position
+		end
+	end
+
+	local parent = safeParent(instance)
+	return parent and parent ~= instance and getWorldPositionFromInstance(parent) or nil
+end
+
+local function scoreStPatricPrompt(prompt)
+	if not prompt or not safeIsA(prompt, "ProximityPrompt") then
+		return 0
+	end
+
+	local activeBrainrots = workspace:FindFirstChild("ActiveBrainrots")
+	if activeBrainrots and safeIsDescendantOf(prompt, activeBrainrots) then
+		return 0
+	end
+
+	local promptData = safePromptData(prompt)
+	local parent = safeParent(prompt)
+	local texts = {
+		safeName(prompt),
+		safeInstancePath(prompt),
+		promptData.actionText,
+		promptData.objectText,
+		safeName(parent),
+		safeInstancePath(parent),
+	}
+	local score = 0
+
+	for _, text in ipairs(texts) do
+		local matched, keyword = containsKeyword(text)
+		if matched then
+			score = score + 2
+			if keyword == "submit" or keyword == "deliver" or keyword == "build" then
+				score = score + 4
+			elseif keyword == "pot" or keyword == "cauld" or keyword == "gold" or keyword == "rainbow" then
+				score = score + 3
+			end
+		end
+	end
+
+	return score
+end
+
+local function findStPatricSubmitPrompt()
+	if stPatricSubmitPromptCache
+		and safeIsA(stPatricSubmitPromptCache, "ProximityPrompt")
+		and safeIsDescendantOf(stPatricSubmitPromptCache, workspace)
+	then
+		local cachedScore = scoreStPatricPrompt(stPatricSubmitPromptCache)
+		if cachedScore > 0 then
+			debugLog("STP_POT", "prompt=" .. safeInstancePath(stPatricSubmitPromptCache) .. " score=" .. tostring(cachedScore) .. " cached=true")
+			return stPatricSubmitPromptCache, cachedScore
+		end
+	end
+
+	local bestPrompt = nil
+	local bestScore = 0
+
+	for _, descendant in ipairs(workspace:GetDescendants()) do
+		if safeIsA(descendant, "ProximityPrompt") then
+			local score = scoreStPatricPrompt(descendant)
+			if score > bestScore then
+				bestScore = score
+				bestPrompt = descendant
+			end
+		end
+	end
+
+	if bestPrompt then
+		stPatricSubmitPromptCache = bestPrompt
+		debugLog("STP_POT", "prompt=" .. safeInstancePath(bestPrompt) .. " score=" .. tostring(bestScore))
+	else
+		stPatricSubmitPromptCache = nil
+		debugLog("STP_POT", "sin prompt de olla")
+	end
+
+	return bestPrompt, bestScore
+end
+
+scoreYesButton = function(button)
+	if not button or not safeIsA(button, "GuiButton") then
+		return 0
+	end
+
+	if not safeGuiVisible(button) then
+		return 0
+	end
+
+	local score = 0
+	local text = safeText(button)
+	local name = safeName(button)
+	local path = safeInstancePath(button)
+
+	score = score + getGuiTextMatchScore(text)
+	score = score + math.max(0, getGuiTextMatchScore(name) - 2)
+	score = score + math.max(0, getGuiTextMatchScore(path) - 4)
+
+	if score <= 0 then
+		return 0
+	end
+
+	if safeGuiArea(button) >= 1200 then
+		score = score + 2
+	end
+
+	local parent = safeParent(button)
+	for _ = 1, 4 do
+		if not parent then
+			break
+		end
+		score = score + getStPatricDialogContextScore(parent)
+		parent = safeParent(parent)
+	end
+
+	if score < 12 then
+		return 0
+	end
+
+	return score
+end
+
+local function scoreFallbackYesButton(button)
+	if not button or not safeIsA(button, "GuiButton") then
+		return 0
+	end
+
+	local text = safeText(button)
+	local name = safeName(button)
+	local path = string.lower(safeInstancePath(button))
+	local score = 0
+
+	score = score + getGuiTextMatchScore(text)
+	score = score + math.max(0, getGuiTextMatchScore(name) - 2)
+	score = score + math.max(0, getGuiTextMatchScore(path) - 4)
+
+	if path:find("choicegui%.choice%.choices%.yes") then
+		score = score + 12
+	elseif path:find("choicegui") and path:find("yes") then
+		score = score + 8
+	end
+
+	if safeGuiArea(button) >= 1200 then
+		score = score + 1
+	end
+
+	return score
+end
+
+local function getRankedStPatricYesButtons(limit)
+	local playerGui = LP:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		return {}
+	end
+
+	local ranked = {}
+	for _, descendant in ipairs(playerGui:GetDescendants()) do
+		if safeIsA(descendant, "GuiButton") then
+			local score = scoreYesButton(descendant)
+			if score > 0 then
+				table.insert(ranked, {
+					button = descendant,
+					score = score,
+					area = safeGuiArea(descendant),
+					path = safeInstancePath(descendant),
+				})
+			end
+		end
+	end
+
+	table.sort(ranked, function(a, b)
+		if a.score ~= b.score then
+			return a.score > b.score
+		end
+		if a.area ~= b.area then
+			return a.area > b.area
+		end
+		return a.path < b.path
+	end)
+
+	if limit and #ranked > limit then
+		for i = #ranked, limit + 1, -1 do
+			table.remove(ranked, i)
+		end
+	end
+
+	if #ranked == 0 then
+		for _, descendant in ipairs(playerGui:GetDescendants()) do
+			if safeIsA(descendant, "GuiButton") then
+				local score = scoreFallbackYesButton(descendant)
+				if score > 0 then
+					table.insert(ranked, {
+						button = descendant,
+						score = score,
+						area = safeGuiArea(descendant),
+						path = safeInstancePath(descendant),
+					})
+				end
+			end
+		end
+
+		table.sort(ranked, function(a, b)
+			if a.score ~= b.score then
+				return a.score > b.score
+			end
+			if a.area ~= b.area then
+				return a.area > b.area
+			end
+			return a.path < b.path
+		end)
+
+		if limit and #ranked > limit then
+			for i = #ranked, limit + 1, -1 do
+				table.remove(ranked, i)
+			end
+		end
+	end
+
+	return ranked
+end
+
+local function findStPatricYesButton()
+	local ranked = getRankedStPatricYesButtons(1)
+	if #ranked == 0 then
+		return nil, 0
+	end
+	return ranked[1].button, ranked[1].score
+end
+
+local function activateStPatricYesButton(button)
+	if not button then
+		return false
+	end
+
+	pcall(function()
+		button.Active = true
+	end)
+	pcall(function()
+		button.Interactable = true
+	end)
+
+	local activated = pcall(function()
+		button:Activate()
+	end)
+
+	if type(firesignal) == "function" then
+		local signalOk = pcall(function()
+			firesignal(button.MouseButton1Click)
+		end)
+		activated = activated or signalOk
+
+		signalOk = pcall(function()
+			firesignal(button.Activated, nil, 1)
+		end)
+		activated = activated or signalOk
+	end
+
+	return activated
+end
+
+local function confirmStPatricDialog(status)
+	local deadline = os.clock() + stPatricConfirmTimeout
+	local dialogSeen = false
+	while os.clock() < deadline do
+		if scriptClosed then
+			return false, dialogSeen
+		end
+
+		local rankedButtons = getRankedStPatricYesButtons(3)
+		local dialogVisible = getVisibleStPatricDialog()
+		dialogSeen = dialogSeen or dialogVisible
+		for _, entry in ipairs(rankedButtons) do
+			local yesButton = entry.button
+			local ok = activateStPatricYesButton(yesButton)
+			debugLog("STP_CONFIRM", "button=" .. safeInstancePath(yesButton) .. " score=" .. tostring(entry.score) .. " ok=" .. tostring(ok))
+			if status then
+				status.Text = ok and "STP: CONFIRMANDO..." or "STP: YES DETECTADO"
+			end
+			if ok then
+				return true, dialogSeen
+			end
+		end
+
+		task.wait(0.05)
+	end
+
+	debugLog("STP_CONFIRM_FAIL", "yes button no detectado")
+	debugLog("STP_CONFIRM_CANDIDATES", getStPatricYesDebugCandidates(5))
+	return false, dialogSeen
+end
+
+local function submitStPatricLoad(status, runToken)
+	if runToken ~= nil and not isOperationValid(runToken) then
+		debugLog("STP_SUBMIT_ABORT", "operacion invalidada antes de entregar")
+		return false
+	end
+	if os.clock() - stPatricLastSubmitAttempt < stPatricSubmitCooldown then
+		releaseAutopilot("STP: ESPERANDO OLLA...", status)
+		return false
+	end
+
+	local carryCount = getEffectiveCarryCount()
+	if carryCount <= 0 then
+		returnLocked = false
+		isReturning = false
+		currentTarget = nil
+		debugLog("STP_RETURN_CLEAR", "sin carry al intentar entregar")
+		return false
+	end
+
+	stPatricLastSubmitAttempt = os.clock()
+	isReturning = true
+	returnLocked = true
+	if mainButton then
+		updateButtonState(mainButton)
+	end
+
+	if not engageAutopilot("STP: LLEVANDO A OLLA...", status) then
+		isReturning = false
+		return false
+	end
+
+	local prompt, promptScore = findStPatricSubmitPrompt()
+	if not prompt or promptScore <= 0 then
+		releaseAutopilot("STP: OLLA NO ENCONTRADA", status)
+		isReturning = false
+		return false
+	end
+
+	local promptPos = getWorldPositionFromInstance(prompt)
+	if promptPos then
+		if not approachStPatricPrompt(promptPos, runToken) then
+			releaseAutopilot("STP: NO SE PUDO ACERCAR A OLLA", status)
+			isReturning = false
+			return false
+		end
+	end
+
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+		prompt.MaxActivationDistance = 100
+		prompt.HoldDuration = 0
+	end)
+
+	local toolsBefore = getFarmToolCount()
+	local successfulConfirms = 0
+	for attempt = 1, 3 do
+		if runToken ~= nil and not isOperationValid(runToken) then
+			debugLog("STP_SUBMIT_ABORT", "operacion invalidada durante entrega")
+			isReturning = false
+			return false
+		end
+
+		local fireOk, fireErr = pcall(function()
+			fireproximityprompt(prompt)
+		end)
+		debugLog("STP_SUBMIT_TRIGGER", "prompt=" .. safeInstancePath(prompt) .. " ok=" .. tostring(fireOk) .. (fireErr and (" err=" .. tostring(fireErr)) or "") .. " attempt=" .. tostring(attempt))
+
+		task.wait(stPatricPostTriggerDelay)
+		local confirmOk, dialogSeen = confirmStPatricDialog(status)
+		if confirmOk then
+			successfulConfirms = successfulConfirms + 1
+		end
+		if not confirmOk and not dialogSeen then
+			task.wait(stPatricImmediateRepromptDelay)
+			local reopenOk, reopenErr = pcall(function()
+				fireproximityprompt(prompt)
+			end)
+			debugLog("STP_SUBMIT_REOPEN", "prompt=" .. safeInstancePath(prompt) .. " ok=" .. tostring(reopenOk) .. (reopenErr and (" err=" .. tostring(reopenErr)) or "") .. " attempt=" .. tostring(attempt))
+			task.wait(stPatricPostTriggerDelay)
+			local retryConfirmOk, retryDialogSeen = confirmStPatricDialog(status)
+			confirmOk = confirmOk or retryConfirmOk
+			dialogSeen = dialogSeen or retryDialogSeen
+			if retryConfirmOk then
+				successfulConfirms = successfulConfirms + 1
+			end
+		end
+		local drainedConfirmations = 0
+		local repromptDone = false
+		local repromptAt = os.clock() + (confirmOk and 0.25 or stPatricRepromptDelay)
+		local assumeSuccessAt = math.huge
+		local confirmSuccessAt = confirmOk and (os.clock() + 0.35) or math.huge
+
+		local deadline = os.clock() + (confirmOk and stPatricConfirmedDrainWindow or stPatricUnconfirmedDrainWindow)
+		while os.clock() < deadline do
+			if runToken ~= nil and not isOperationValid(runToken) then
+				debugLog("STP_SUBMIT_ABORT", "operacion invalidada esperando confirmacion de entrega")
+				isReturning = false
+				return false
+			end
+			if isRespawning then
+				debugLog("STP_SUBMIT_ABORT", "respawn detectado durante confirmacion de entrega")
+				isReturning = false
+				return false
+			end
+			if promptPos then
+				local holdY = math.max(resolveTravelY(promptPos, nil, true), promptPos.Y + stPatricPromptHeightOffset)
+				local holdGoal = CFrame.new(promptPos.X, holdY, promptPos.Z)
+				if getGoalDistance(holdGoal) > stPatricHoldSnapDistance then
+					snapCharacterTo(holdGoal)
+				end
+			end
+			local toolsNow = getFarmToolCount()
+			local carryNow = getEffectiveCarryCount()
+			local dialogVisible, dialogPath, dialogScore = getVisibleStPatricDialog()
+			local carryDrained = toolsNow < toolsBefore or carryNow <= 0
+			local promptData = safePromptData(prompt)
+			if confirmOk and not carryDrained and not dialogVisible and not repromptDone and os.clock() >= repromptAt then
+				local retryOk, retryErr = pcall(function()
+					fireproximityprompt(prompt)
+				end)
+				debugLog("STP_SUBMIT_RETRY", "prompt=" .. safeInstancePath(prompt) .. " ok=" .. tostring(retryOk) .. (retryErr and (" err=" .. tostring(retryErr)) or ""))
+				repromptDone = true
+				assumeSuccessAt = os.clock() + stPatricAssumeSubmitDelay
+			end
+			if carryDrained and not dialogVisible then
+				drainedConfirmations = drainedConfirmations + 1
+			else
+				drainedConfirmations = 0
+			end
+			if drainedConfirmations >= stPatricRequiredDrainChecks and (confirmOk or dialogSeen or not promptData.enabled) then
+				return finalizeStPatricSubmitSuccess(status, runToken, carryCount, toolsBefore, toolsNow, dialogScore, dialogPath, "STP_SUBMIT_OK")
+			end
+			if confirmOk and (not dialogVisible or successfulConfirms >= 2) and os.clock() >= confirmSuccessAt then
+				return finalizeStPatricSubmitSuccess(status, runToken, carryCount, toolsBefore, toolsNow, dialogScore, dialogPath, "STP_SUBMIT_CONFIRM_OK")
+			end
+			if confirmOk and repromptDone and not dialogVisible and os.clock() >= assumeSuccessAt then
+				return finalizeStPatricSubmitSuccess(status, runToken, carryCount, toolsBefore, toolsNow, dialogScore, dialogPath, "STP_SUBMIT_ASSUME_OK")
+			end
+			task.wait(stPatricSubmitCheckInterval)
+		end
+	end
+
+	if successfulConfirms >= 2 then
+		return finalizeStPatricSubmitSuccess(status, runToken, carryCount, toolsBefore, getFarmToolCount(), 0, "repeat-confirm", "STP_SUBMIT_MULTI_CONFIRM")
+	end
+
+	debugLog("STP_SUBMIT_FAIL", "sin confirmacion de entrega")
+	if getEffectiveCarryCount() <= 0 then
+		return finalizeStPatricSubmitSuccess(status, runToken, carryCount, toolsBefore, getFarmToolCount(), 0, "none", "STP_SUBMIT_FAIL_CLEAR")
+	end
+	isReturning = false
+	releaseAutopilot("STP: ENTREGA FALLIDA", status)
+	return false
+end
+
+local function bindBrainrotWatcher()
+	if brainrotAddedConn then
+		brainrotAddedConn:Disconnect()
+		brainrotAddedConn = nil
+	end
+
+	local brainrots = workspace:FindFirstChild("ActiveBrainrots")
+	if not brainrots then
+		return
+	end
+
+	brainrotAddedConn = brainrots.DescendantAdded:Connect(function(desc)
+		if desc.Name == "RenderedBrainrot" and desc:IsA("Model") then
+			forceRescan = true
+			pendingBrainrotSpawnCount = pendingBrainrotSpawnCount + 1
+			pendingBrainrotSpawnSample = pendingBrainrotSpawnSample or desc:GetFullName()
+
+			local now = os.clock()
+			if now - lastBrainrotSpawnLog >= brainrotSpawnLogWindow then
+				if pendingBrainrotSpawnCount >= 2 then
+					debugLog(
+						"BRAINROT_SPAWN",
+						string.format("batch=%d sample=%s", pendingBrainrotSpawnCount, tostring(pendingBrainrotSpawnSample or desc:GetFullName()))
+					)
+				end
+				lastBrainrotSpawnLog = now
+				pendingBrainrotSpawnCount = 0
+				pendingBrainrotSpawnSample = nil
+			end
+		end
+	end)
+end
+
+local guiParent = pcall(function()
+	return gethui()
+end) and gethui() or game:GetService("CoreGui")
+
+local oldGui = guiParent:FindFirstChild("OsakaV79Fix")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local sg = Instance.new("ScreenGui")
+sg.Name = "OsakaV79Fix"
+sg.ResetOnSpawn = false
+sg.Parent = guiParent
+
+local frame = Instance.new("Frame", sg)
+frame.Size = UDim2.new(0, 172, 0, 38)
+frame.Position = UDim2.new(0.05, 0, 0.3, 0)
+frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+frame.Active = true
+frame.Draggable = true
+Instance.new("UICorner", frame)
+
+local expanded = false
+local filtersExpanded = false
+
+local towerBtn = Instance.new("TextButton", sg)
+towerBtn.Size = UDim2.new(0, 84, 0, 24)
+towerBtn.Position = UDim2.new(0.05, 0, 0.3, -28)
+towerBtn.BackgroundColor3 = Color3.fromRGB(35, 40, 45)
+towerBtn.Font = Enum.Font.GothamBold
+towerBtn.TextSize = 11
+towerBtn.BorderSizePixel = 0
+Instance.new("UICorner", towerBtn)
+towerBtn.Visible = false
+towerButton = towerBtn
+
+local shieldBtn = Instance.new("TextButton", sg)
+shieldBtn.Size = UDim2.new(0, 84, 0, 24)
+shieldBtn.Position = UDim2.new(0.05, 88, 0.3, -28)
+shieldBtn.BackgroundColor3 = Color3.fromRGB(35, 40, 45)
+shieldBtn.Font = Enum.Font.GothamBold
+shieldBtn.TextSize = 11
+shieldBtn.BorderSizePixel = 0
+Instance.new("UICorner", shieldBtn)
+shieldBtn.Visible = false
+shieldButton = shieldBtn
+
+local btn = Instance.new("TextButton", frame)
+btn.Size = UDim2.new(1, -74, 0, 32)
+btn.Position = UDim2.new(0, 6, 0, 3)
+btn.TextColor3 = Color3.new(1, 1, 1)
+btn.Font = Enum.Font.GothamBold
+btn.TextSize = 13
+Instance.new("UICorner", btn)
+mainButton = btn
+
+local expandBtn = Instance.new("TextButton", frame)
+expandBtn.Size = UDim2.new(0, 30, 0, 32)
+expandBtn.Position = UDim2.new(1, -68, 0, 3)
+expandBtn.Text = "+"
+expandBtn.TextColor3 = Color3.new(1, 1, 1)
+expandBtn.BackgroundColor3 = Color3.fromRGB(35, 40, 45)
+expandBtn.Font = Enum.Font.GothamBold
+expandBtn.TextSize = 18
+Instance.new("UICorner", expandBtn)
+
+local closeBtn = Instance.new("TextButton", frame)
+closeBtn.Size = UDim2.new(0, 30, 0, 32)
+closeBtn.Position = UDim2.new(1, -36, 0, 3)
+closeBtn.Text = "X"
+closeBtn.TextColor3 = Color3.new(1, 1, 1)
+closeBtn.BackgroundColor3 = Color3.fromRGB(120, 45, 45)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+Instance.new("UICorner", closeBtn)
+
+local panel = Instance.new("Frame", frame)
+panel.Position = UDim2.new(0, 6, 0, 40)
+panel.Size = UDim2.new(1, -12, 0, 140)
+panel.BackgroundTransparency = 1
+panel.Visible = false
+
+local status = Instance.new("TextLabel", panel)
+status.Size = UDim2.new(1, 0, 0, 20)
+status.Position = UDim2.new(0, 0, 0, 0)
+status.Text = "ST PATRIC: ESPERANDO"
+status.TextColor3 = Color3.new(1, 1, 1)
+status.BackgroundTransparency = 1
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+
+local limitLabel = Instance.new("TextLabel", panel)
+limitLabel.Size = UDim2.new(1, 0, 0, 18)
+limitLabel.Position = UDim2.new(0, 0, 0, 24)
+limitLabel.Text = "LIMITE"
+limitLabel.TextColor3 = Color3.new(0.8, 0.8, 0.8)
+limitLabel.BackgroundTransparency = 1
+limitLabel.Font = Enum.Font.Gotham
+limitLabel.TextSize = 11
+limitLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local limitRow = Instance.new("Frame", panel)
+limitRow.Size = UDim2.new(1, 0, 0, 28)
+limitRow.Position = UDim2.new(0, 0, 0, 46)
+limitRow.BackgroundTransparency = 1
+
+local limitMinus = Instance.new("TextButton", limitRow)
+limitMinus.Size = UDim2.new(0, 28, 0, 28)
+limitMinus.Position = UDim2.new(0, 0, 0, 0)
+limitMinus.Text = "-"
+limitMinus.TextColor3 = Color3.new(1, 1, 1)
+limitMinus.BackgroundColor3 = Color3.fromRGB(35, 40, 45)
+limitMinus.Font = Enum.Font.GothamBold
+limitMinus.TextSize = 16
+Instance.new("UICorner", limitMinus)
+
+local limitValue = Instance.new("TextLabel", limitRow)
+limitValue.Size = UDim2.new(1, -64, 0, 28)
+limitValue.Position = UDim2.new(0, 32, 0, 0)
+limitValue.Text = tostring(returnAt)
+limitValue.TextColor3 = Color3.new(1, 1, 1)
+limitValue.BackgroundColor3 = Color3.fromRGB(22, 24, 28)
+limitValue.Font = Enum.Font.GothamBold
+limitValue.TextSize = 13
+Instance.new("UICorner", limitValue)
+
+local limitPlus = Instance.new("TextButton", limitRow)
+limitPlus.Size = UDim2.new(0, 28, 0, 28)
+limitPlus.Position = UDim2.new(1, -28, 0, 0)
+limitPlus.Text = "+"
+limitPlus.TextColor3 = Color3.new(1, 1, 1)
+limitPlus.BackgroundColor3 = Color3.fromRGB(35, 40, 45)
+limitPlus.Font = Enum.Font.GothamBold
+limitPlus.TextSize = 16
+Instance.new("UICorner", limitPlus)
+
+local filtersBtn = Instance.new("TextButton", panel)
+filtersBtn.Size = UDim2.new(1, 0, 0, 28)
+filtersBtn.Position = UDim2.new(0, 0, 0, 80)
+filtersBtn.Text = "FILTROS ▾"
+filtersBtn.TextColor3 = Color3.new(1, 1, 1)
+filtersBtn.BackgroundColor3 = Color3.fromRGB(35, 40, 45)
+filtersBtn.Font = Enum.Font.GothamBold
+filtersBtn.TextSize = 12
+Instance.new("UICorner", filtersBtn)
+filtersBtn.Visible = false
+
+local copyLogsBtn = Instance.new("TextButton", panel)
+copyLogsBtn.Size = UDim2.new(0.5, -2, 0, 24)
+copyLogsBtn.Position = UDim2.new(0, 0, 0, 114)
+copyLogsBtn.TextColor3 = Color3.new(1, 1, 1)
+copyLogsBtn.BackgroundColor3 = Color3.fromRGB(65, 90, 140)
+copyLogsBtn.Font = Enum.Font.GothamBold
+copyLogsBtn.TextSize = 11
+copyLogsBtn.BorderSizePixel = 0
+Instance.new("UICorner", copyLogsBtn)
+copyLogsButton = copyLogsBtn
+
+local resetLogsBtn = Instance.new("TextButton", panel)
+resetLogsBtn.Size = UDim2.new(0.5, -2, 0, 24)
+resetLogsBtn.Position = UDim2.new(0.5, 2, 0, 114)
+resetLogsBtn.Text = "COPIAR + NUEVOS 250"
+resetLogsBtn.TextColor3 = Color3.new(1, 1, 1)
+resetLogsBtn.BackgroundColor3 = Color3.fromRGB(110, 75, 45)
+resetLogsBtn.Font = Enum.Font.GothamBold
+resetLogsBtn.TextSize = 11
+resetLogsBtn.BorderSizePixel = 0
+Instance.new("UICorner", resetLogsBtn)
+resetLogsButton = resetLogsBtn
+
+local scroll = Instance.new("ScrollingFrame", frame)
+scroll.Size = UDim2.new(1, -12, 0, 146)
+scroll.Position = UDim2.new(0, 6, 0, 184)
+scroll.BackgroundTransparency = 1
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.ScrollBarThickness = 4
+scroll.Visible = false
+
+local listLayout = Instance.new("UIListLayout", scroll)
+listLayout.Padding = UDim.new(0, 4)
+
+local function disconnectConnection(conn)
+	if conn then
+		conn:Disconnect()
+	end
+	return nil
+end
+
+local function shutdownScript()
+	if scriptClosed then
+		return
+	end
+
+	logEnabled = false
+	scriptClosed = true
+	isRespawning = false
+	watchMode = false
+	autoPilot = false
+	isReturning = false
+	isGrabbing = false
+	returnLocked = false
+	eventShieldMode = false
+	forceRescan = false
+	currentTarget = nil
+	blacklist = {}
+	targetCache = {}
+	storedLogs = {}
+	lastScanSummary = ""
+	lastSelectionSummary = ""
+	lastScanHint = ""
+	startupReleaseTime = 0
+	firstTripPending = false
+	shieldCFrame = nil
+	shieldBaseCFrame = nil
+	shieldRetreatOffset = 0
+	shieldLastHealth = nil
+	shieldLastDamageTime = 0
+	shieldLastRecoverTime = 0
+	lastBrainrotSpawnLog = 0
+	pendingBrainrotSpawnCount = 0
+	pendingBrainrotSpawnSample = nil
+	activeRunToken = activeRunToken + 1
+
+	local humanoid = getHumanoid()
+	local root = getRoot()
+	restoreCharacterCollisionState()
+	if root then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		root.Anchored = false
+	end
+	if humanoid then
+		humanoid.PlatformStand = false
+	end
+
+	diedConn = disconnectConnection(diedConn)
+	charAddedConn = disconnectConnection(charAddedConn)
+	brainrotAddedConn = disconnectConnection(brainrotAddedConn)
+	steppedConn = disconnectConnection(steppedConn)
+
+	if mainLoopThread then
+		pcall(function()
+			task.cancel(mainLoopThread)
+		end)
+		mainLoopThread = nil
+	end
+
+	mainButton = nil
+	towerButton = nil
+	shieldButton = nil
+	copyLogsButton = nil
+	resetLogsButton = nil
+
+	if sg then
+		sg:Destroy()
+		sg = nil
+	end
+end
+
+local function applyLayout()
+	if scriptClosed then
+		return
+	end
+	panel.Visible = expanded
+	scroll.Visible = expanded and filtersExpanded
+	expandBtn.Text = expanded and "−" or "+"
+	filtersBtn.Text = filtersExpanded and "FILTROS ▴" or "FILTROS ▾"
+
+	if not expanded then
+		frame.Size = UDim2.new(0, 172, 0, 38)
+	elseif filtersExpanded then
+		frame.Size = UDim2.new(0, 172, 0, 336)
+	else
+		frame.Size = UDim2.new(0, 172, 0, 184)
+	end
+
+	scroll.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 8)
+end
+
+local function updateReturnLimit(delta)
+	if scriptClosed then
+		return
+	end
+	limitValue.Text = tostring(returnAt)
+end
+
+limitMinus.MouseButton1Click:Connect(function()
+	updateReturnLimit(-1)
+end)
+
+limitPlus.MouseButton1Click:Connect(function()
+	updateReturnLimit(1)
+end)
+
+expandBtn.MouseButton1Click:Connect(function()
+	if scriptClosed then
+		return
+	end
+	expanded = not expanded
+	if not expanded then
+		filtersExpanded = false
+	end
+	applyLayout()
+end)
+
+filtersBtn.MouseButton1Click:Connect(function()
+	if scriptClosed then
+		return
+	end
+	filtersExpanded = not filtersExpanded
+	applyLayout()
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+	shutdownScript()
+end)
+
+towerBtn.MouseButton1Click:Connect(function()
+	if scriptClosed then
+		return
+	end
+	status.Text = "ST PATRIC DEDICADO"
+end)
+
+shieldBtn.MouseButton1Click:Connect(function()
+	if scriptClosed then
+		return
+	end
+	status.Text = "ST PATRIC DEDICADO"
+end)
+
+copyLogsBtn.MouseButton1Click:Connect(function()
+	if scriptClosed then
+		return
+	end
+	copyLogsToClipboard(status)
+	updateCopyLogsButtonState()
+end)
+
+resetLogsBtn.MouseButton1Click:Connect(function()
+	if scriptClosed then
+		return
+	end
+	copyLogsAndReset(status)
+end)
+
+for _, name in ipairs(filterOrder) do
+	local filterButton = Instance.new("TextButton", scroll)
+	filterButton.Size = UDim2.new(1, 0, 0, 24)
+	filterButton.Text = name
+	filterButton.BackgroundColor3 = filtros[name] and Color3.fromRGB(0, 200, 100) or Color3.fromRGB(35, 40, 45)
+	filterButton.TextColor3 = Color3.new(0.9, 0.9, 0.9)
+	filterButton.Font = Enum.Font.Gotham
+	filterButton.TextSize = 12
+	Instance.new("UICorner", filterButton)
+
+	filterButton.MouseButton1Click:Connect(function()
+		if scriptClosed then
+			return
+		end
+		filtros[name] = not filtros[name]
+		filterButton.BackgroundColor3 = filtros[name] and Color3.fromRGB(0, 200, 100) or Color3.fromRGB(35, 40, 45)
+		refreshTargets(true)
+	end)
+	end
+
+listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(applyLayout)
+applyLayout()
+updateReturnLimit()
+updateTowerButtonState()
+updateShieldButtonState()
+updateCopyLogsButtonState()
+
+steppedConn = RS.Stepped:Connect(function()
+	if scriptClosed then
+		return
+	end
+
+	local now = os.clock()
+
+	if now >= nextWaveCleanup then
+		nextWaveCleanup = now + waveCleanupInterval
+		for _, v in ipairs(workspace:GetDescendants()) do
+			local lowered = string.lower(v.Name)
+			if lowered:find("tsunami") or lowered:find("wave") or lowered:find("water") or lowered:find("acid") then
+				if v:IsA("BasePart") then
+					v.Transparency = 0
+					v.LocalTransparencyModifier = 0
+					v.CanCollide = false
+					v.CanTouch = false
+				elseif v:IsA("Decal") or v:IsA("Texture") then
+					v.Transparency = 0
+				elseif v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Beam") then
+					v.Enabled = true
+				end
+			end
+		end
+	end
+
+	if not autoPilot and not eventShieldMode then
+		restoreCharacterCollisionState()
+		return
+	end
+
+	local character = LP.Character
+	local root = getRoot()
+	local humanoid = getHumanoid()
+	if not character or not root then
+		return
+	end
+
+	if eventShieldMode and shieldCFrame then
+		if humanoid then
+			if shieldLastHealth and humanoid.Health > 0 and humanoid.Health < shieldLastHealth then
+				local damageTaken = shieldLastHealth - humanoid.Health
+				local retreatAmount = damageTaken >= shieldDamageThreshold and shieldEmergencyStep or shieldRetreatStep
+				shieldRetreatOffset = math.max(shieldRetreatOffset - retreatAmount, -shieldRetreatMax)
+				shieldLastDamageTime = now
+				updateShieldCFrame()
+				if shieldAutoHeal then
+					pcall(function()
+						humanoid.Health = humanoid.MaxHealth
+					end)
+				end
+			elseif now - shieldLastDamageTime >= shieldRecoverDelayAfterHit
+				and now - shieldLastRecoverTime >= shieldRecoverInterval
+			then
+				shieldRetreatOffset = math.min(shieldRetreatOffset + shieldRecoverStep, shieldSinkOffset)
+				shieldLastRecoverTime = now
+				updateShieldCFrame()
+			end
+			shieldLastHealth = humanoid.Health
+			configureShieldHumanoid(humanoid, true)
+		end
+		pcall(function()
+			character:PivotTo(shieldCFrame)
+		end)
+	else
+		root.CFrame = flyValue.Value
+	end
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+
+	enforceCharacterNoCollision(character)
+end)
+
+local function bindCharacter(btnRef, statusRef)
+	if diedConn then
+		diedConn:Disconnect()
+		diedConn = nil
+	end
+
+	local character = getCharacter()
+	local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+	if humanoid then
+		diedConn = humanoid.Died:Connect(function()
+			if scriptClosed then
+				return
+			end
+			isRespawning = true
+			debugLog("DEATH", "personaje murio, watchMode=" .. tostring(watchMode))
+			stopFarm("RESPAWN DETECTADO - REARMANDO...", btnRef, statusRef, true)
+		end)
+	end
+end
+
+bindCharacter(btn, status)
+bindBrainrotWatcher()
+
+if charAddedConn then
+	charAddedConn:Disconnect()
+end
+
+charAddedConn = LP.CharacterAdded:Connect(function()
+	if scriptClosed then
+		return
+	end
+	debugLog("CHARACTER_ADDED", "nuevo character detectado")
+	task.wait(0.75)
+	if scriptClosed then
+		return
+	end
+	bindCharacter(btn, status)
+	if watchMode then
+		local root = getRoot()
+		if root then
+			invalidateRunToken("characterAdded")
+			resetRunState()
+			if not basePos then
+				basePos = root.Position
+			end
+			if travelBaseY == nil then
+				travelBaseY = root.Position.Y
+			end
+			flyValue.Value = root.CFrame
+			captureBaselineTools()
+			armStartupStabilization("respawn")
+			isRespawning = false
+			releaseAutopilot("STP: BUSCANDO BRAINROTS...", status)
+			refreshTargets(true)
+		end
+	end
+end)
+
+btn.MouseButton1Click:Connect(function()
+	if scriptClosed then
+		return
+	end
+
+	local character = getCharacter()
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then
+		status.Text = "PERSONAJE INVALIDO"
+		return
+	end
+
+	updateReturnLimit()
+	if watchMode and (autoPilot or isReturning or isGrabbing) then
+		debugLog(
+			"WATCH_OFF_BLOCKED",
+			string.format(
+				"state=%s autoPilot=%s returning=%s grabbing=%s target=%s",
+				getCompactStateLabel(),
+				tostring(autoPilot),
+				tostring(isReturning),
+				tostring(isGrabbing),
+				currentTarget and currentTarget:GetFullName() or "nil"
+			)
+		)
+		status.Text = "BLOQUEADO: AUTOFARM EN CURSO"
+		updateButtonState(btn)
+		return
+	end
+	watchMode = not watchMode
+	updateButtonState(btn)
+
+	if watchMode then
+		if eventShieldMode then
+			setEventShieldMode(false, status)
+		end
+		resetSessionProgress()
+		invalidateRunToken("watchOn")
+		debugLog("STP_ON", string.format("base=(%.2f, %.2f, %.2f)", root.Position.X, root.Position.Y, root.Position.Z))
+		basePos = root.Position
+		travelBaseY = root.Position.Y
+		flyValue.Value = root.CFrame
+		root.Anchored = false
+		captureBaselineTools()
+		armStartupStabilization("watchOn")
+		resetRunState()
+		bindBrainrotWatcher()
+		refreshTargets(true)
+		status.Text = "STP: BUSCANDO BRAINROTS..."
+		releaseAutopilot("STP: BUSCANDO BRAINROTS...", status)
+	else
+		invalidateRunToken("watchOff")
+		debugLog("STP_OFF", "script en espera")
+		releaseAutopilot("ST PATRIC: ESPERANDO", status)
+		resetRunState()
+	end
+end)
+
+mainLoopThread = task.spawn(function()
+	while task.wait(0.08) do
+		local ok, err = xpcall(function()
+			if scriptClosed then
+				return "break"
+			end
+
+			if eventShieldMode then
+				return
+			end
+
+			if not watchMode then
+				return
+			end
+
+			if isRespawning then
+				releaseAutopilot("RESPAWN DETECTADO - REARMANDO...", status)
+				return
+			end
+
+			local runToken = activeRunToken
+
+			if startupReleaseTime > 0 and os.clock() < startupReleaseTime then
+				releaseAutopilot("ESTABILIZANDO...", status)
+				return
+			end
+
+			updateReturnLimit()
+			local carryCount = getEffectiveCarryCount()
+
+			if returnLocked and carryCount <= 0 then
+				returnLocked = false
+				isReturning = false
+				currentTarget = nil
+				debugLog("STP_RETURN_CLEAR", "carry agotado, liberando retorno")
+				releaseAutopilot("STP: BUSCANDO BRAINROTS...", status)
+				return
+			end
+
+			local humanoid = getHumanoid()
+			local root = getRoot()
+			if not humanoid or not root or humanoid.Health <= 0 then
+				return
+			end
+
+			if returnLocked or carryCount >= returnAt then
+				returnLocked = true
+				if isReturning then
+					status.Text = "STP: LLEVANDO A OLLA..."
+					return
+				end
+				debugLog("STP_RETURN", "returnLocked=" .. tostring(returnLocked) .. " inv=" .. tostring(invCount) .. " carry=" .. tostring(carryCount))
+				if os.clock() - stPatricLastSubmitAttempt < stPatricSubmitCooldown then
+					releaseAutopilot("STP: ESPERANDO OLLA...", status)
+					return
+				end
+				submitStPatricLoad(status, runToken)
+				return
+			end
+
+			local target, availableCount = getStPatricTarget()
+			if not target then
+				debugLog("STP_NO_TARGET", "inv=" .. tostring(invCount) .. " returnLocked=" .. tostring(returnLocked))
+				if (invCount > 0 or returnLocked) and not isReturning and not isGrabbing then
+					returnLocked = invCount > 0 or returnLocked
+					submitStPatricLoad(status, runToken)
+				else
+					currentTarget = nil
+					releaseAutopilot("STP: BUSCANDO BRAINROTS...", status)
+				end
+				return
+			end
+
+			local targetPos = getTargetPosition(target)
+			if not targetPos then
+				debugLog("TARGET_DROP", "sin posicion -> " .. tostring(target and target:GetFullName() or "nil"))
+				blacklist[target] = true
+				currentTarget = nil
+				removeFromCache(target)
+				return
+			end
+
+			if not engageAutopilot("OBJETIVOS: " .. tostring(availableCount) .. " | " .. tostring(carryCount) .. "/" .. tostring(returnAt), status) then
+				return
+			end
+
+			local dist = (root.Position - targetPos).Magnitude
+			if dist > 8 then
+				debugLog("STP_TRAVEL", string.format("target=%s rarity=%s dist=%.2f", target:GetFullName(), getTargetRarity(target), dist))
+				status.Text = "VIAJANDO A " .. getTargetRarity(target)
+				local reached = ghostTravel(targetPos, nil, nil, runToken)
+				if not reached then
+					debugLog("TRAVEL_RECOVER", "fallo viaje principal")
+					emergencyRecover(status)
+					return
+				end
+			end
+
+			root = getRoot()
+			targetPos = getTargetPosition(target)
+			local postTravelDistance = math.huge
+			if root and targetPos then
+				postTravelDistance = (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
+			end
+			if postTravelDistance > 10 then
+				debugLog("GRAB_ABORT", string.format("demasiado lejos tras viaje horizontal=%.2f", postTravelDistance))
+				currentTarget = nil
+				return
+			end
+
+			if not isValidTarget(target) then
+				debugLog("TARGET_DROP", "target invalido tras viaje -> " .. tostring(target and target:GetFullName() or "nil"))
+				currentTarget = nil
+				removeFromCache(target)
+				return
+			end
+
+			local success = grabItem(target, runToken)
+			if success then
+				firstTripPending = false
+				invCount = invCount + 1
+				sessionGrabCount = sessionGrabCount + 1
+				local syncedCount = syncInventoryCountFromTools()
+				if syncedCount > 0 then
+					invCount = math.max(invCount, syncedCount)
+				end
+				debugLog("STP_GRAB_OK", "inv=" .. tostring(invCount) .. " total=" .. tostring(sessionGrabCount) .. " tools=" .. tostring(getFarmToolCount()))
+				if invCount >= returnAt then
+					returnLocked = true
+				end
+				grabAttempts = 0
+				blacklist[target] = true
+				currentTarget = nil
+				removeFromCache(target)
+				refreshTargets(true)
+				status.Text = "STP: " .. tostring(invCount) .. "/" .. tostring(returnAt)
+
+				if returnLocked or invCount >= returnAt then
+					debugLog("STP_TRIGGER", "limite alcanzado")
+					submitStPatricLoad(status, runToken)
+				else
+					task.wait(0.12)
+				end
+			else
+				local carryAfterFail = getEffectiveCarryCount()
+				if returnLocked or carryAfterFail >= returnAt then
+					returnLocked = true
+					grabAttempts = 0
+					currentTarget = nil
+					debugLog("STP_RETURN", "grab cancelado por limite carry=" .. tostring(carryAfterFail) .. "/" .. tostring(returnAt))
+					if not isReturning then
+						submitStPatricLoad(status, runToken)
+					end
+					return
+				end
+
+				local currentHumanoid = getHumanoid()
+				if currentHumanoid then
+					logHealthState("grab_fail", currentHumanoid)
+				end
+				grabAttempts = grabAttempts + 1
+				debugLog("STP_GRAB_FAIL", "fail intento=" .. tostring(grabAttempts))
+				status.Text = "STP FAIL " .. tostring(grabAttempts) .. "/3"
+				if grabAttempts >= 3 then
+					blacklist[target] = true
+					currentTarget = nil
+					grabAttempts = 0
+					removeFromCache(target)
+					refreshTargets(true)
+					status.Text = "IGNORADO"
+					task.wait(0.1)
+				end
+			end
+		end, debug.traceback)
+
+		if not ok then
+			debugLog("MAIN_LOOP_ERROR", tostring(err))
+			releaseAutopilot("ERROR EN MAIN LOOP", status)
+		end
+
+		if ok and err == "break" then
+			break
+		end
+	end
+end)
