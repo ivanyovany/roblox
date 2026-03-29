@@ -1869,7 +1869,17 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
     end
 
     local function hasCarrySwapEvidence()
+        local recentTriggerWindow = math.max(
+            Config.BurstCarryConfirmWindow or 0,
+            Config.BurstPostFireConfirmWindow or 0,
+            Config.BurstPostFireResolveWindow or 0,
+            0.25
+        )
+        local recentTriggerObserved = triggeredObservedAt > 0 and (tick() - triggeredObservedAt) <= (recentTriggerWindow + 0.15)
+
         return hasCarryEvidence()
+            or recentTriggerObserved
+            or triggeredObserved
             or hasPromptHiddenAfterInteraction()
             or (probableObservedAt > 0 and probableReason ~= nil and probableReason ~= "PROMPT_HIDDEN_AFTER_TRIGGER")
     end
@@ -2713,7 +2723,8 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
         end
 
         if triggeredObserved then
-            Logger:Log("[TELEMETRY] RETRY_AFTER_TRIGGER attempt=" .. tostring(attempt), Color3.new(1, 1, 0))
+            Logger:Log("[TELEMETRY] POST_TRIGGER_OBSERVE_ONLY attempt=" .. tostring(attempt), Color3.new(1, 1, 0))
+            break
         end
 
         do
