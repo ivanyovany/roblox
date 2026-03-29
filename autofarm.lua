@@ -563,7 +563,14 @@ end
 
 local function GetBurstPickupCFrame(targetRoot, prompt)
     local promptPos = GetPromptWorldPosition(prompt, targetRoot and targetRoot.Position or nil)
-    local burstY = math.max(promptPos.Y + Config.BurstPromptRootOffset, Config.Y_Transito + 1.25)
+    local fallenLimit = workspace.FallenPartsDestroyHeight or -500
+    local minSafeY = fallenLimit + 25
+    local referenceY = (Config.Home and Config.Home.Position.Y) or promptPos.Y
+    local transitDepthY = math.max(referenceY + (Config.BurstTransitDepth or 0), minSafeY)
+    local offsetY = promptPos.Y + (Config.BurstPromptRootOffset or 0)
+
+    -- El script que si funciona no se posiciona sobre el prompt; mantiene el HRP a profundidad de transito.
+    local burstY = math.min(offsetY, transitDepthY)
 
     local burstPos = Vector3.new(promptPos.X, burstY, promptPos.Z)
     local burstLook = Vector3.new(targetRoot.Position.X, burstY, targetRoot.Position.Z)
@@ -2788,11 +2795,6 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
         end
 
         if hasPromptHiddenAfterInteraction() or probableObservedAt > 0 then
-            Logger:Log("[TELEMETRY] POST_TRIGGER_OBSERVE_ONLY attempt=" .. tostring(attempt), Color3.new(1, 1, 0))
-            break
-        end
-
-        if triggeredObserved then
             Logger:Log("[TELEMETRY] POST_TRIGGER_OBSERVE_ONLY attempt=" .. tostring(attempt), Color3.new(1, 1, 0))
             break
         end
