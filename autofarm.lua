@@ -3,32 +3,50 @@
 -- ==========================================================
 
 local CoreGui = game:GetService("CoreGui")
-local HttpService = game:GetService("HttpService")
+local State = rawget(_G, "__SpyScannerState") or {}
+State.logBuffer = State.logBuffer or {}
+State.maxLogs = 300
+State.isLogging = true
+_G.__SpyScannerState = State
 
 -- 1. CONFIGURACIÓN DEL BUFFER (CERO LAG)
-local logBuffer = {}
-local maxLogs = 300 -- Límite de eventos antes de pausar para no dar lag
-local isLogging = true
+local maxLogs = State.maxLogs -- Límite de eventos antes de pausar para no dar lag
 
 local function addLog(titulo, detalles)
-    if not isLogging or #logBuffer >= maxLogs then return end
+    if not State.isLogging or #State.logBuffer >= maxLogs then return end
 
     local logString = "[" .. os.date("%H:%M:%S") .. "] 🕵️ " .. titulo .. "\n"
     for k, v in pairs(detalles) do
         logString = logString .. "  ↳ " .. tostring(k) .. ": " .. tostring(v) .. "\n"
     end
     logString = logString .. "-----------------------------------\n"
-    
-    table.insert(logBuffer, logString)
-    
+
+    table.insert(State.logBuffer, logString)
+
     -- Actualizar contador en la UI
-    if _G.UpdateLogCount then _G.UpdateLogCount(#logBuffer) end
+    if State.UpdateLogCount then State.UpdateLogCount(#State.logBuffer) end
 end
 
+State.addLog = addLog
+
 -- 2. CREACIÓN DE LA UI MINIMALISTA Y ARRASTRABLE
+local guiParent = CoreGui
+local hasGuiParent, executorGui = pcall(function()
+    return gethui and gethui()
+end)
+if hasGuiParent and executorGui then
+    guiParent = executorGui
+end
+
+local existingGui = guiParent:FindFirstChild("SpyScannerGUI") or CoreGui:FindFirstChild("SpyScannerGUI")
+if existingGui then
+    existingGui:Destroy()
+end
+
 local SpyGui = Instance.new("ScreenGui")
 SpyGui.Name = "SpyScannerGUI"
-SpyGui.Parent = pcall(function() return gethui() end) and gethui() or CoreGui
+SpyGui.Parent = guiParent
+State.Gui = SpyGui
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Size = UDim2.new(0, 220, 0, 110)
@@ -80,7 +98,7 @@ ClearBtn.Text = "🗑️ LIMPIAR"
 ClearBtn.Parent = MainFrame
 
 -- Función para actualizar el texto del contador
-_G.UpdateLogCount = function(count)
+State.UpdateLogCount = function(count)
     if count >= maxLogs then
         StatusLabel.Text = "⚠️ LÍMITE ALCANZADO: " .. count
         StatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
@@ -90,10 +108,12 @@ _G.UpdateLogCount = function(count)
     end
 end
 
+State.UpdateLogCount(#State.logBuffer)
+
 -- Lógica de Botones
 CopyBtn.MouseButton1Click:Connect(function()
-    if #logBuffer > 0 then
-        local fullText = table.concat(logBuffer, "\n")
+    if #State.logBuffer > 0 then
+        local fullText = table.concat(State.logBuffer, "\n")
         local success = pcall(function()
             if setclipboard then setclipboard(fullText)
             elseif toclipboard then toclipboard(fullText) end
@@ -107,40 +127,52 @@ CopyBtn.MouseButton1Click:Connect(function()
 end)
 
 ClearBtn.MouseButton1Click:Connect(function()
-    logBuffer = {}
-    isLogging = true
-    _G.UpdateLogCount(0)
+    if table.clear then
+        table.clear(State.logBuffer)
+    else
+        State.logBuffer = {}
+    end
+    State.isLogging = true
+    State.UpdateLogCount(0)
     ClearBtn.Text = "¡LIMPIO!"
     task.wait(1)
     ClearBtn.Text = "🗑️ LIMPIAR"
 end)
 
 -- 3. HOOKS (LOS ESPÍAS)
-if fireproximityprompt then
-    local old_fire
-    old_fire = hookfunction(fireproximityprompt, function(prompt, amount, skip)
-        addLog("fireproximityprompt", {
-            ["Prompt"] = prompt:GetFullName(),
-            ["ActionText"] = prompt.ActionText,
-        })
-        return old_fire(prompt, amount, skip)
-    end)
-end
-
-local mt = getrawmetatable(game)
-local old_newindex = mt.__newindex
-setreadonly(mt, false)
-
-mt.__newindex = newcclosure(function(obj, prop, val)
-    if typeof(obj) == "Instance" and obj:IsA("ProximityPrompt") then
-        if prop == "HoldDuration" or prop == "MaxActivationDistance" or prop == "RequiresLineOfSight" then
-            addLog("Propiedad Alterada", {
-                ["Prompt"] = obj:GetFullName(),
-                ["Propiedad"] = prop,
-                ["Nuevo Valor"] = tostring(val)
-            })
-        end
+if not State.HooksInstalled then
+    if fireproximityprompt then
+        local old_fire
+        old_fire = hookfunction(fireproximityprompt, function(prompt, amount, skip)
+            if State.addLog then
+                State.addLog("fireproximityprompt", {
+                    ["Prompt"] = prompt:GetFullName(),
+                    ["ActionText"] = prompt.ActionText,
+                })
+            end
+            return old_fire(prompt, amount, skip)
+        end)
     end
-    return old_newindex(obj, prop, val)
-end)
-setreadonly(mt, true)
+
+    local mt = getrawmetatable(game)
+    local old_newindex = mt.__newindex
+    setreadonly(mt, false)
+
+    mt.__newindex = newcclosure(function(obj, prop, val)
+        if typeof(obj) == "Instance" and obj:IsA("ProximityPrompt") then
+            if prop == "HoldDuration" or prop == "MaxActivationDistance" or prop == "RequiresLineOfSight" then
+                if State.addLog then
+                    State.addLog("Propiedad Alterada", {
+                        ["Prompt"] = obj:GetFullName(),
+                        ["Propiedad"] = prop,
+                        ["Nuevo Valor"] = tostring(val)
+                    })
+                end
+            end
+        end
+        return old_newindex(obj, prop, val)
+    end)
+    setreadonly(mt, true)
+
+    State.HooksInstalled = true
+end
