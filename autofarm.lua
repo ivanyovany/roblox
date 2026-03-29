@@ -82,10 +82,50 @@ local MAX_LOGS = 60
 local Connections = {}
 local Threads = {}
 
-local function safeConnect(event, callback)
-    local conn = event:Connect(callback)
+local Logger = nil
+
+local function reportProtectedError(context, err)
+    local message = tostring(err)
+    local trace = debug.traceback(message, 2)
+    local lines = {}
+
+    for line in string.gmatch(trace, "[^\r\n]+") do
+        table.insert(lines, line)
+    end
+
+    if Logger then
+        Logger.LastErrorLines = lines
+        Logger:Log("[SCRIPT_ERROR] " .. tostring(context) .. ": " .. message, Color3.new(1, 0.2, 0.2))
+        for index, line in ipairs(lines) do
+            if index > 1 then
+                Logger:Log("[STACK] " .. tostring(line), Color3.new(1, 0.5, 0.5))
+            end
+        end
+    end
+
+    return message
+end
+
+local function connectProtected(event, callback, context)
+    return event:Connect(function(...)
+        xpcall(callback, function(err)
+            return reportProtectedError(context or "EVENT_CALLBACK", err)
+        end, ...)
+    end)
+end
+
+local function safeConnect(event, callback, context)
+    local conn = connectProtected(event, callback, context)
     table.insert(Connections, conn)
     return conn
+end
+
+local function safeSpawn(context, callback)
+    return task.spawn(function()
+        xpcall(callback, function(err)
+            return reportProtectedError(context or "TASK", err)
+        end)
+    end)
 end
 
 local Config = {
@@ -388,9 +428,10 @@ end
 -- 2. CAPA UI & LOGGER (Ring Buffer)
 -- ==============================================================================
 local UI = { LogLabels = {}, ButtonPool = {}, Minimized = false }
-local Logger = { 
+Logger = {
     Buffer = table.create(400, ""), LogIndex = 1,
-    Snapshots = table.create(30), SnapIndex = 1 
+    Snapshots = table.create(30), SnapIndex = 1,
+    LastErrorLines = nil
 }
 
 local sg = Instance.new("ScreenGui"); sg.Name = scriptName; sg.ResetOnSpawn = false; sg.Parent = GuiParent
@@ -452,6 +493,28 @@ function Logger:Dump(reason)
                 tick() - s.t, s.hp, s.y, s.vy, s.phase, s.distXZ, stateA), Color3.new(0.8, 0.8, 0.8))
         end
     end
+end
+
+function Logger:BuildCopyPayload()
+    local cleanBuffer = {}
+
+    if self.LastErrorLines and #self.LastErrorLines > 0 then
+        table.insert(cleanBuffer, "===== LAST_SCRIPT_ERROR =====")
+        for _, line in ipairs(self.LastErrorLines) do
+            table.insert(cleanBuffer, line)
+        end
+        table.insert(cleanBuffer, "===== LOG_BUFFER =====")
+    end
+
+    for i = 0, 399 do
+        local idx = ((self.LogIndex + i - 1) % 400) + 1
+        local line = self.Buffer[idx]
+        if line and line ~= "" then
+            table.insert(cleanBuffer, line)
+        end
+    end
+
+    return table.concat(cleanBuffer, "\n")
 end
 
 -- ==============================================================================
@@ -2282,6 +2345,8 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
         return true, nil
     end
 
+    local waitForClaimSettle
+
     local function waitForPostFireResolution(reason)
         local baseWindow = math.max(Config.BurstPostFireResolveWindow or 0, 0)
         local deadline = tick() + baseWindow
@@ -2346,7 +2411,7 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
         return false, nil
     end
 
-    local function waitForClaimSettle(claimReason)
+    waitForClaimSettle = function(claimReason)
         Logger:Log("[TELEMETRY] CLAIM_SEEN_SETTLING: " .. tostring(claimReason), Color3.new(0, 1, 1))
         local releaseOk, releaseReason = runPostTriggerMicroRelease(claimReason)
         if not releaseOk then
@@ -2920,7 +2985,7 @@ end
 -- ==============================================================================
 -- 7. EVENTOS Y CONTROL DE FLUJO
 -- ==============================================================================
-table.insert(Threads, task.spawn(function()
+table.insert(Threads, safeSpawn("Heartbeat Monitor", function()
     while RS.Heartbeat:Wait() do
         local char, hrp, hum = FSM:GetValidEntity()
         if hrp and hum then
@@ -2999,7 +3064,7 @@ table.insert(Threads, task.spawn(function()
     end 
 end))
 
-table.insert(Threads, task.spawn(function()
+table.insert(Threads, safeSpawn("Target Picker", function()
     while task.wait(0.2) do
         if Config.Activo and FSM.Phase == "IDLE" and not FSM:HasPendingCarrySwap() then
             local char, hrp = FSM:GetValidEntity()
@@ -3039,7 +3104,7 @@ table.insert(Threads, task.spawn(function()
 end))
 
 local lastMutsCache = ""
-table.insert(Threads, task.spawn(function()
+table.insert(Threads, safeSpawn("Mutation Scanner", function()
     while task.wait(1.5) do
         if Config.Activo then continue end
         local folder = workspace:FindFirstChild("ActiveBrainrots"); if not folder then continue end
@@ -3066,12 +3131,12 @@ table.insert(Threads, task.spawn(function()
         autoButtonData.btn.Text = "AUTO ATRIBUTOS"
         autoButtonData.btn.BackgroundColor3 = (getActiveTargetMode() == "ATTRIBUTES") and Color3.fromRGB(0,120,200) or Color3.fromRGB(45,45,45)
         if autoButtonData.conn then autoButtonData.conn:Disconnect() end
-        autoButtonData.conn = autoButtonData.btn.MouseButton1Click:Connect(function()
+        autoButtonData.conn = connectProtected(autoButtonData.btn.MouseButton1Click, function()
             Config.Mutacion = nil
             lastMutsCache = ""
             refreshTitle()
             Logger:Log("[TARGET_MODE] " .. getTargetModeSummary(), Color3.new(0, 1, 1))
-        end)
+        end, "Auto Target Mode Button")
 
         for i, m in ipairs(keys) do 
             local poolIndex = i + 1
@@ -3082,12 +3147,12 @@ table.insert(Threads, task.spawn(function()
             local bData = UI.ButtonPool[poolIndex] 
             bData.btn.Visible = true; bData.btn.Text = m; bData.btn.BackgroundColor3 = (Config.Mutacion == m) and Color3.fromRGB(0,120,200) or Color3.fromRGB(45,45,45) 
             if bData.conn then bData.conn:Disconnect() end 
-            bData.conn = bData.btn.MouseButton1Click:Connect(function()
+            bData.conn = connectProtected(bData.btn.MouseButton1Click, function()
                 Config.Mutacion = m
                 lastMutsCache = ""
                 refreshTitle()
                 Logger:Log("[TARGET_MODE] " .. getTargetModeSummary(), Color3.new(0, 1, 1))
-            end) 
+            end, "Mutation Button") 
         end 
         for i = #keys + 2, #UI.ButtonPool do UI.ButtonPool[i].btn.Visible = false end
     end 
@@ -3104,37 +3169,28 @@ safeConnect(topBar.InputBegan, function(input)
         dragStart = input.Position 
         startPos = main.Position 
     end 
-end)
+end, "TopBar InputBegan")
 
 safeConnect(UIS.InputChanged, function(input) 
     if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then 
         local delta = input.Position - dragStart 
         main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y) 
     end 
-end)
+end, "UIS InputChanged")
 
 safeConnect(UIS.InputEnded, function(input) 
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
         dragging = false 
     end 
-end)
+end, "UIS InputEnded")
 
 safeConnect(btnCopy.MouseButton1Click, function()
-    local cleanBuffer = {}
-    for i = 0, 399 do
-        local idx = ((Logger.LogIndex + i - 1) % 400) + 1
-        local line = Logger.Buffer[idx]
-        if line and line ~= "" then
-            table.insert(cleanBuffer, line)
-        end
-    end
-
-    if copyToClipboard(table.concat(cleanBuffer, "\n")) then
+    if copyToClipboard(Logger:BuildCopyPayload()) then
         Logger:Log("LOGS COPIADOS", Color3.new(0,1,0))
     else
         Logger:Log("PORTAPAPELES NO DISPONIBLE", Color3.new(1,0.5,0))
     end
-end)
+end, "Copy Button")
 
 safeConnect(btnToggle.MouseButton1Click, function()
     UI.Minimized = not UI.Minimized
@@ -3144,7 +3200,7 @@ safeConnect(btnToggle.MouseButton1Click, function()
     logBox.Visible = not UI.Minimized
     mutScroll.Visible = not UI.Minimized
     footer.Visible = not UI.Minimized
-end)
+end, "Toggle Button")
 
 safeConnect(btnAction.MouseButton1Click, function()
     local char, hrp, hum = FSM:GetValidEntity()
@@ -3188,7 +3244,7 @@ safeConnect(btnAction.MouseButton1Click, function()
         btnAction.BackgroundColor3 = Color3.fromRGB(0, 150, 50)
         FSM:StopSafely()
     end
-end)
+end, "Action Button")
 
 safeConnect(player.CharacterRemoving, function(char)
     Logger:Dump("CHARACTER_REMOVING")
@@ -3203,7 +3259,7 @@ safeConnect(player.CharacterRemoving, function(char)
         Config.Activo = false
         btnAction.Text = "INICIAR"; btnAction.BackgroundColor3 = Color3.fromRGB(0, 150, 50)
     end
-end)
+end, "CharacterRemoving")
 
 safeConnect(player.CharacterAdded, function(char)
     FSM.LastRespawnAt = tick()
@@ -3211,7 +3267,7 @@ safeConnect(player.CharacterAdded, function(char)
     FSM:ClearTargets()
     Logger:Log("[RESPAWN] CharacterAdded detectado", Color3.new(0, 1, 1))
 
-    task.spawn(function()
+    safeSpawn("CharacterAdded Resume", function()
         task.wait(0.4)
         local respawnStamp = FSM.LastRespawnAt
         local ok, reason = FSM:WaitForStableWindow(Config.RespawnStableFrames, {
@@ -3284,7 +3340,7 @@ safeConnect(player.CharacterAdded, function(char)
             Logger:Log("[RESPAWN_UNSTABLE] " .. tostring(reason), Color3.new(1, 0.5, 0))
         end
     end)
-end)
+end, "CharacterAdded")
 
 _G.IvanFarmer_Cleanup = function()
     Config.Activo = false; FSM.Session += 1
