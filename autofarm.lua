@@ -1,6 +1,6 @@
 --[[
 BRAINROT FARMER V236 - ATTRIBUTE TARGETING + HARD PICKUP CONFIRM
-Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro ds
+Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro
 
 CAMBIOS V236:
 1. Nuevo modo auto por atributos si no se selecciona mutacion manual.
@@ -169,6 +169,7 @@ local Config = {
     BurstRapidAttempts = 4,
     BurstHoldAttempts = 2,
     BurstRapidAttemptDelay = 0.08,
+    BurstPerAttemptResolveWindow = 0.12,
     BurstPostFireConfirmWindow = 4.50,  -- ampliado: da tiempo al server para procesar tras trigger  -- ampliado: dar tiempo al servidor para adjuntar RenderedBrainrot
     BurstPromptSetupDelay = 0.15,
     BurstClaimSettleWindow = 5.00,
@@ -564,6 +565,39 @@ local function GetPromptWorldPosition(prompt, fallback)
     end
 
     return fallback
+end
+
+local function FindTargetPrompt(targetModel, targetRoot, promptHint)
+    if promptHint and promptHint:IsA("ProximityPrompt") and promptHint:IsDescendantOf(workspace) then
+        return promptHint
+    end
+
+    local searchRoots = {}
+    if targetModel then
+        table.insert(searchRoots, targetModel)
+    end
+    if targetRoot then
+        table.insert(searchRoots, targetRoot)
+    end
+    if targetRoot and targetRoot.Parent and targetRoot.Parent ~= targetModel then
+        table.insert(searchRoots, targetRoot.Parent)
+    end
+
+    for _, searchRoot in ipairs(searchRoots) do
+        if searchRoot then
+            local namedPrompt = searchRoot:FindFirstChild("TakePrompt", true)
+            if namedPrompt and namedPrompt:IsA("ProximityPrompt") and namedPrompt:IsDescendantOf(workspace) then
+                return namedPrompt
+            end
+
+            local anyPrompt = searchRoot:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if anyPrompt and anyPrompt:IsDescendantOf(workspace) then
+                return anyPrompt
+            end
+        end
+    end
+
+    return nil
 end
 
 local function GetBurstPickupCFrame(targetRoot, prompt)
@@ -1737,6 +1771,9 @@ end
 
 function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
     local char, hrp, hum = FSM:GetValidEntity()
+    local targetContainer = targetRoot and targetRoot.Parent or nil
+    local targetModel = targetContainer and targetContainer:IsA("Model") and targetContainer or nil
+    prompt = FindTargetPrompt(targetModel, targetRoot, prompt)
     if not hrp then return false, "NO_ENTITY" end
     if not prompt or not prompt:IsDescendantOf(workspace) then return false, "NO_PROMPT" end
 
@@ -1753,8 +1790,6 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
     local lastInteractionAt = 0
     local triggeredObservedAt = 0
     local hoverHoldLogged = false
-    local targetContainer = targetRoot and targetRoot.Parent or nil
-    local targetModel = targetContainer and targetContainer:IsA("Model") and targetContainer or nil
     local activeBrainrots = workspace:FindFirstChild("ActiveBrainrots")
     local toolSnapshotBefore = GetOwnedToolCounts()
     local characterChildrenBefore = GetChildSignatureCounts(char)
@@ -2360,7 +2395,7 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
     local waitForClaimSettle
 
     local function waitForPostFireResolution(reason)
-        local baseWindow = math.max(Config.BurstPostFireResolveWindow or 0, 0)
+        local baseWindow = math.max(Config.BurstPerAttemptResolveWindow or Config.BurstPostFireResolveWindow or 0, 0)
         local deadline = tick() + baseWindow
         local extendedDeadline = deadline
         if deadline <= tick() then
@@ -2902,6 +2937,8 @@ end
 -- ==============================================================================
 local function FarmRoutine(targetRoot, prompt)
     if FSM.Phase ~= "IDLE" then return end
+    local targetModel = targetRoot and targetRoot.Parent
+    prompt = FindTargetPrompt(targetModel and targetModel:IsA("Model") and targetModel or nil, targetRoot, prompt)
     if not targetRoot or not targetRoot:IsDescendantOf(workspace) or not prompt or not prompt:IsDescendantOf(workspace) or not prompt.Enabled then return end
     
     local char, hrp = FSM:GetValidEntity()
@@ -3082,7 +3119,7 @@ table.insert(Threads, safeSpawn("Target Picker", function()
                     for _, rarityFolder in pairs(folder:GetChildren()) do 
                         for _, rot in pairs(rarityFolder:GetChildren()) do
                             local tr = rot:FindFirstChild("Root")
-                            local pr = rot:FindFirstChild("TakePrompt", true)
+                            local pr = FindTargetPrompt(rot, tr, nil)
                             if tr and pr and pr.Enabled and (not FSM:IsTargetCoolingDown(tr, pr)) then
                                 local candidate = evaluateTargetCandidate(rot, tr, pr, hrp)
                                 if candidate then
