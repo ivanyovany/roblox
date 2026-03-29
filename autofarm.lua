@@ -1,6 +1,6 @@
 --[[
 BRAINROT FARMER V236 - ATTRIBUTE TARGETING + HARD PICKUP CONFIRM
-Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado seguro0
+Arquitectura: FSM Estricta, DEAD terminal, recovery estable y BURST sellado segurosd
 
 CAMBIOS V236:
 1. Nuevo modo auto por atributos si no se selecciona mutacion manual.
@@ -162,7 +162,7 @@ local Config = {
     BurstPostTriggerGrace = 0.05,
     BurstCarrySwapAutoResume = true,
     BurstFallbackFireInHold = false,
-    BurstSpoofHoldDuration = true,
+    BurstSpoofHoldDuration = false,
     BurstSpoofHoldValue = 0.0,
     BurstCarryConfirmWindow = 2.50,  -- ampliado: espera que server replique reparent
     BurstPromptMaxDistance = 100,
@@ -170,9 +170,9 @@ local Config = {
     BurstHoldAttempts = 2,
     BurstRapidAttemptDelay = 0.08,
     BurstPerAttemptResolveWindow = 0.12,
-    BurstPostFireConfirmWindow = 4.50,  -- ampliado: da tiempo al server para procesar tras trigger  -- ampliado: dar tiempo al servidor para adjuntar RenderedBrainrot
+    BurstPostFireConfirmWindow = 6.50,  -- ampliado: da tiempo al server para procesar tras trigger  -- ampliado: dar tiempo al servidor para adjuntar RenderedBrainrot
     BurstPromptSetupDelay = 0.15,
-    BurstClaimSettleWindow = 5.00,
+    BurstClaimSettleWindow = 6.00,
     CarrySwapResumeConfirmWindow = 4.00,
     CarryClearHomeWindow = 3.00,
     CarryClearPoll = 0.05,
@@ -1809,6 +1809,7 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
         MaxActivationDistance = prompt.MaxActivationDistance,
         HoldDuration = prompt.HoldDuration,
     }
+    local originalPromptHoldDuration = math.max(promptPropsBefore.HoldDuration or 0, 0)
     local burstHumanoidPropsBefore = hum and {
         PlatformStand = hum.PlatformStand,
         AutoRotate = hum.AutoRotate,
@@ -2728,6 +2729,23 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
     local function performPromptInteraction(liveChar, liveRoot, livePrompt)
         if not livePrompt then return false, "NO_PROMPT" end
 
+        local holdDuration = (originalPromptHoldDuration > 0) and originalPromptHoldDuration or (livePrompt.HoldDuration or 0)
+
+        if holdDuration > 0 then
+            local ok, err = pcall(function()
+                livePrompt:InputHoldBegin()
+                task.wait(holdDuration + Config.BurstHoldExtra)
+                livePrompt:InputHoldEnd()
+            end)
+            if ok then
+                return true, "INPUT_HOLD"
+            end
+
+            if not Config.BurstFallbackFireInHold then
+                return false, err
+            end
+        end
+
         if fireproximityprompt then
             local ok, err = pcall(function()
                 fireproximityprompt(livePrompt)
@@ -2735,26 +2753,13 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
             if ok then
                 return true, "FIRE_PROMPT"
             end
-
-            if (livePrompt.HoldDuration or 0) <= 0 and not Config.BurstFallbackFireInHold then
-                return false, err
-            end
-        end
-
-        local holdDuration = livePrompt.HoldDuration or 0
-        if holdDuration > 0 then
-            local ok, err = pcall(function()
-                livePrompt:InputHoldBegin()
-                task.wait(holdDuration + Config.BurstHoldExtra)
-                livePrompt:InputHoldEnd()
-            end)
-            return ok, ok and "INPUT_HOLD" or err
+            return false, err
         end
 
         return false, "NO_INTERACT_IMPL"
     end
 
-    local totalAttempts = ((prompt.HoldDuration or 0) > 0) and Config.BurstHoldAttempts or Config.BurstRapidAttempts
+    local totalAttempts = (originalPromptHoldDuration > 0) and Config.BurstHoldAttempts or Config.BurstRapidAttempts
 
     for attempt = 1, totalAttempts do
         if not Config.Activo then return finishBurst(false, "BURST_ABORT_MANUAL") end
