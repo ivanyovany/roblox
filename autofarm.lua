@@ -1,5 +1,5 @@
 -- ==========================================================
--- SPY SCANNER OPTIMIZADO: GUI ARRASTRABLE + BUFFER CERO LAGg
+-- SPY SCANNER OPTIMIZADO: GUI ARRASTRABLE + BUFFER CERO LAG
 -- ==========================================================
 
 local CoreGui = game:GetService("CoreGui")
@@ -38,9 +38,13 @@ if hasGuiParent and executorGui then
     guiParent = executorGui
 end
 
-local existingGui = guiParent:FindFirstChild("SpyScannerGUI") or CoreGui:FindFirstChild("SpyScannerGUI")
-if existingGui then
-    existingGui:Destroy()
+for _, parent in ipairs({guiParent, CoreGui}) do
+    if parent then
+        local existingGui = parent:FindFirstChild("SpyScannerGUI")
+        if existingGui then
+            existingGui:Destroy()
+        end
+    end
 end
 
 local SpyGui = Instance.new("ScreenGui")
@@ -130,7 +134,9 @@ ClearBtn.MouseButton1Click:Connect(function()
     if table.clear then
         table.clear(State.logBuffer)
     else
-        State.logBuffer = {}
+        for _ = #State.logBuffer, 1, -1 do
+            table.remove(State.logBuffer)
+        end
     end
     State.isLogging = true
     State.UpdateLogCount(0)
@@ -144,12 +150,10 @@ if not State.HooksInstalled then
     if fireproximityprompt then
         local old_fire
         old_fire = hookfunction(fireproximityprompt, function(prompt, amount, skip)
-            if State.addLog then
-                State.addLog("fireproximityprompt", {
-                    ["Prompt"] = prompt:GetFullName(),
-                    ["ActionText"] = prompt.ActionText,
-                })
-            end
+            State.addLog("fireproximityprompt", {
+                ["Prompt"] = prompt:GetFullName(),
+                ["ActionText"] = prompt.ActionText,
+            })
             return old_fire(prompt, amount, skip)
         end)
     end
@@ -161,13 +165,11 @@ if not State.HooksInstalled then
     mt.__newindex = newcclosure(function(obj, prop, val)
         if typeof(obj) == "Instance" and obj:IsA("ProximityPrompt") then
             if prop == "HoldDuration" or prop == "MaxActivationDistance" or prop == "RequiresLineOfSight" then
-                if State.addLog then
-                    State.addLog("Propiedad Alterada", {
-                        ["Prompt"] = obj:GetFullName(),
-                        ["Propiedad"] = prop,
-                        ["Nuevo Valor"] = tostring(val)
-                    })
-                end
+                State.addLog("Propiedad Alterada", {
+                    ["Prompt"] = obj:GetFullName(),
+                    ["Propiedad"] = prop,
+                    ["Nuevo Valor"] = tostring(val)
+                })
             end
         end
         return old_newindex(obj, prop, val)
