@@ -119,14 +119,14 @@ local Config = {
     BurstFallbackFireInHold = false,
     BurstSpoofHoldDuration = true,
     BurstSpoofHoldValue = 0.0,
-    BurstCarryConfirmWindow = 0.90,
+    BurstCarryConfirmWindow = 2.50,  -- ampliado: espera que server replique reparent
     BurstPromptMaxDistance = 100,
     BurstRapidAttempts = 4,
     BurstHoldAttempts = 2,
     BurstRapidAttemptDelay = 0.08,
     BurstPostFireConfirmWindow = 2.00,  -- ampliado: dar tiempo al servidor para adjuntar RenderedBrainrot
     BurstPromptSetupDelay = 0.15,
-    BurstClaimSettleWindow = 4.00,
+    BurstClaimSettleWindow = 5.00,
     CarrySwapResumeConfirmWindow = 4.00,
     CarryClearHomeWindow = 3.00,
     CarryClearPoll = 0.05,
@@ -1988,9 +1988,14 @@ function Motor:ExecuteBurst(targetRoot, prompt, cCobro, burstToken)
             end
         end
 
+        -- RenderedBrainrot en personaje: señal directa de carry para este juego.
+        -- Solo necesita triggeredObserved (no carryLinkedToCurrentTarget) porque el
+        -- servidor reparentea el modelo aquí mismo después del trigger.
         local rendered = liveChar:FindFirstChild("RenderedBrainrot") or liveChar:FindFirstChild("RenderedBrainrot", true)
-        if rendered and rendered:IsA("Model") and carryLinkedToCurrentTarget then
-            return true, "CHAR_RENDERED_OK"
+        if rendered and rendered:IsA("Model") then
+            if carryLinkedToCurrentTarget or triggeredObserved then
+                return true, "CHAR_RENDERED_OK"
+            end
         end
 
         local rightGrip = liveChar:FindFirstChild("RightGrip", true)
